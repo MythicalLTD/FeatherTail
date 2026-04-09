@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "franneck94.vscode-rust-config",
+        "llvm-vs-code-extensions.lldb-dap",
+        "serayuzgur.crates",
+        "vadimcn.vscode-lldb",
+        "editorconfig.editorconfig",
+        "ms-vscode.makefile-tools",
+        "esbenp.prettier-vscode",
+        "yzhang.markdown-all-in-one",
+        "redhat.vscode-yaml"
+    ]
+}
