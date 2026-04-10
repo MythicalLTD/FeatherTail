@@ -32,6 +32,24 @@ fn normalize_log_level(value: &str) -> String {
     value.to_owned()
 }
 
+fn validate_config(cfg: &AppConfig) -> Result<(), String> {
+    if cfg.api.bind == "string"
+        || cfg.proxmox.pvesh_bin == "string"
+        || cfg.proxmox.pct_bin == "string"
+        || cfg.dhcp.bind == "string"
+        || cfg.dhcp.server_ip == "string"
+        || cfg.dhcp.database_path == "string"
+    {
+        return Err("configuration contains placeholder 'string' values; update feathertail.toml with real paths/addresses".to_owned());
+    }
+
+    if cfg.daemon.poll_interval_secs == 0 {
+        return Err("daemon.poll_interval_secs must be > 0".to_owned());
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let local_default = "feathertail.toml";
@@ -84,6 +102,11 @@ async fn main() {
         }
     };
 
+    if let Err(err) = validate_config(&config) {
+        eprintln!("invalid config {}: {err}", config_path);
+        std::process::exit(1);
+    }
+
     init_logging(&config.daemon.log_level);
 
     if !vnc_assets::is_proxmox_host() {
@@ -108,7 +131,7 @@ async fn main() {
         "starting proxmox daemon"
     );
 
-    let mut daemon = match Daemon::new(config).await {
+    let mut daemon = match Daemon::new(config, config_path.clone()).await {
         Ok(d) => d,
         Err(err) => {
             error!(error = %err, "failed to initialize daemon");

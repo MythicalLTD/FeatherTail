@@ -17,6 +17,7 @@ type DynError = Box<dyn Error + Send + Sync>;
 
 pub struct Daemon {
     config: AppConfig,
+    config_path: String,
     proxmox: Arc<ProxmoxClient>,
     dhcp: Arc<DhcpService>,
     seen_qemu_vmids: HashSet<u32>,
@@ -25,12 +26,13 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub async fn new(config: AppConfig) -> Result<Self, DynError> {
+    pub async fn new(config: AppConfig, config_path: String) -> Result<Self, DynError> {
         let proxmox = Arc::new(ProxmoxClient::new(&config.proxmox));
         let dhcp = Arc::new(DhcpService::new(config.dhcp.clone()).await?);
         let info_yapless = config.daemon.log_level.eq_ignore_ascii_case("info-yapless");
         Ok(Self {
             config,
+            config_path,
             proxmox,
             dhcp,
             seen_qemu_vmids: HashSet::new(),
@@ -155,6 +157,9 @@ impl Daemon {
         let app = routes::build_app(routes::AppState {
             daemon_name: self.config.daemon.name.clone(),
             auth_token: self.config.auth.api_token.clone(),
+            config_path: self.config_path.clone(),
+            api_bind: self.config.api.bind.clone(),
+            dhcp_enabled: self.dhcp.enabled(),
             proxmox: Arc::clone(&self.proxmox),
             dhcp: if self.dhcp.enabled() {
                 Some(Arc::clone(&self.dhcp))

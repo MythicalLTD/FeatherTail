@@ -14,6 +14,9 @@ use crate::proxmox::ProxmoxClient;
 pub struct AppState {
     pub daemon_name: String,
     pub auth_token: String,
+    pub config_path: String,
+    pub api_bind: String,
+    pub dhcp_enabled: bool,
     pub proxmox: Arc<ProxmoxClient>,
     pub dhcp: Option<Arc<DhcpService>>,
 }

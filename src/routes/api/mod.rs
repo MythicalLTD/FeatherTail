@@ -5,7 +5,7 @@ pub mod servers;
 pub mod system;
 
 use axum::middleware;
-use axum::{Router, routing::{get, post}};
+use axum::{Router, routing::{get, post, put}};
 
 use crate::auth;
 use crate::routes::AppState;
@@ -14,6 +14,12 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/system/health", get(system::health))
         .route("/system/stats", get(system::stats))
+        .route("/system/diagnostics", get(system::diagnostics))
+        .route("/system/logs", get(system::logs))
+        .route("/system/config", get(system::get_config))
+        .route("/system/config", put(system::update_config))
+        .route("/system/restart", post(system::restart))
+        .route("/system/update", post(system::self_update))
         .route("/proxmox/version", get(proxmox::version))
         .route("/proxmox/nodes", get(proxmox::nodes))
         .route("/dhcp/leases", get(dhcp::list_leases))

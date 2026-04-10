@@ -3,8 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -50,7 +51,7 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DaemonConfig {
     #[serde(default = "default_daemon_name")]
     pub name: String,
@@ -70,7 +71,7 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProxmoxConfig {
     #[serde(default = "default_pvesh_bin")]
     pub pvesh_bin: String,
@@ -87,7 +88,7 @@ impl Default for ProxmoxConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiConfig {
     #[serde(default = "default_api_bind")]
     pub bind: String,
@@ -101,7 +102,7 @@ impl Default for ApiConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AuthConfig {
     #[serde(default = "default_api_token")]
     pub api_token: String,
@@ -115,7 +116,7 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DhcpConfig {
     #[serde(default = "default_dhcp_enabled")]
     pub enabled: bool,
