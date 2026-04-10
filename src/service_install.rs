@@ -74,6 +74,19 @@ fn install_binary() -> Result<(), DynError> {
         fs::create_dir_all(parent)?;
     }
 
+    // If target exists and service is running, stop it first to avoid "text file busy" error
+    if target.exists() {
+        let service_running = Command::new("systemctl")
+            .args(&["is-active", "--quiet", "feathertail.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if service_running {
+            run_systemctl(&["stop", "feathertail.service"])?;
+        }
+    }
+
     fs::copy(&source, target)?;
 
     #[cfg(unix)]
