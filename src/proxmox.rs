@@ -2,7 +2,7 @@ use std::error::Error;
 use std::io;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::process::Command;
 use utoipa::ToSchema;
 
@@ -106,38 +106,6 @@ impl ProxmoxClient {
         }
 
         Ok(())
-    }
-
-    pub async fn execute(&self, method: &str, path: &str, params: &[(String, String)]) -> Result<Value, DynError> {
-        let mut cmd = Command::new(&self.pvesh_bin);
-        cmd.arg(method).arg(path);
-
-        for (key, value) in params {
-            cmd.arg(format!("-{key}")).arg(value);
-        }
-
-        if method == "get" {
-            cmd.arg("--output-format").arg("json");
-        }
-
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let err = io::Error::other(format!("pvesh {method} {path} failed: {stderr}"));
-            return Err(Box::new(err));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if stdout.is_empty() {
-            return Ok(json!({ "status": "ok" }));
-        }
-
-        if let Ok(parsed) = serde_json::from_str::<Value>(&stdout) {
-            return Ok(parsed);
-        }
-
-        Ok(json!({ "output": stdout }))
     }
 
     async fn get_json(&self, path: &str) -> Result<Value, DynError> {
