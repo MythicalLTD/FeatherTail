@@ -69,6 +69,10 @@ jobs:
             echo "No Cargo.toml changes to commit"
           else
             git commit -m "release: bump version to $VERSION"
+
+            # Fetch latest and rebase to handle concurrent pushes
+            git fetch origin "${{ github.event.repository.default_branch }}"
+            git rebase "origin/${{ github.event.repository.default_branch }}"
             git push origin "HEAD:${{ github.event.repository.default_branch }}"
           fi
 
