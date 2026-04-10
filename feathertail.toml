@@ -1,0 +1,13 @@
+[daemon]
+name = "feathertail-proxmox"
+poll_interval_secs = 15
+log_level = "info"
+
+[proxmox]
+pvesh_bin = "pvesh"
+
+[api]
+bind = "0.0.0.0:8686"
+
+[auth]
+api_token = "change-me"

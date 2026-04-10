@@ -1,13 +1,13 @@
 install-buildkit:
-	apt update 
+	apt update
 	apt upgrade -y
-	apt install -y build-essential make git curl wget sudo 
+	apt install -y build-essential make git curl wget sudo
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 release:
 	cargo build --release
 
-debug: 
+debug:
 	cargo build
 
 run-debug:
@@ -16,5 +16,5 @@ run-debug:
 run-release:
 	./target/release/feathertail
 
-debug-run: 
+run:
 	cargo run
