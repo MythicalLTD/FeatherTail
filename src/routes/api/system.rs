@@ -277,7 +277,15 @@ pub async fn self_update(
     download_to_file(FEATHERTAIL_UPDATE_URL, tmp_path).await?;
 
     let current_exe = std::env::current_exe().map_err(internal_error)?;
-    std::fs::copy(tmp_path, &current_exe).map_err(internal_error)?;
+
+    // Rename the current executable to .old to avoid "text file busy" error
+    let backup_exe = format!("{}.old", current_exe.display());
+    if current_exe.exists() {
+        std::fs::rename(&current_exe, &backup_exe).map_err(internal_error)?;
+    }
+
+    // Move the new binary into place
+    std::fs::rename(tmp_path, &current_exe).map_err(internal_error)?;
 
     #[cfg(unix)]
     {
