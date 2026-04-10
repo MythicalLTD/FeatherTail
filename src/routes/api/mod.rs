@@ -1,4 +1,5 @@
 pub mod containers;
+pub mod dhcp;
 pub mod proxmox;
 pub mod servers;
 pub mod system;
@@ -15,6 +16,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/system/stats", get(system::stats))
         .route("/proxmox/version", get(proxmox::version))
         .route("/proxmox/nodes", get(proxmox::nodes))
+        .route("/dhcp/leases", get(dhcp::list_leases))
+        .route("/dhcp/leases", post(dhcp::assign_lease))
+        .route("/dhcp/leases/vm/{vmid}", axum::routing::delete(dhcp::delete_lease))
         .route("/servers", get(servers::list_servers))
         .route("/containers", get(containers::list_containers))
         .route(

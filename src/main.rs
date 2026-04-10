@@ -1,9 +1,12 @@
 mod auth;
 mod config;
 mod daemon;
+mod dhcp;
 mod openapi;
 mod proxmox;
 mod routes;
+mod service_install;
+mod vnc_assets;
 
 use std::env;
 use std::path::Path;
@@ -14,20 +17,37 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(default_level: &str) {
+    let normalized_level = normalize_log_level(default_level);
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level.to_owned()));
+        .unwrap_or_else(|_| EnvFilter::new(normalized_level));
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+fn normalize_log_level(value: &str) -> String {
+    if value.eq_ignore_ascii_case("info-yapless") {
+        return "info".to_owned();
+    }
+
+    value.to_owned()
+}
+
 #[tokio::main]
 async fn main() {
-    let mut config_path = "feathertail.toml".to_owned();
+    let local_default = "feathertail.toml";
+    let system_default = "/etc/feathertail/feathertail.toml";
+    let mut config_path = if Path::new(local_default).exists() {
+        local_default.to_owned()
+    } else {
+        system_default.to_owned()
+    };
     let mut run_once = false;
+    let mut service_install_mode = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "service-install" => service_install_mode = true,
             "--once" => run_once = true,
             "--config" => {
                 if let Some(path) = args.next() {
@@ -43,6 +63,19 @@ async fn main() {
         }
     }
 
+    if service_install_mode {
+        match service_install::install_service(&config_path) {
+            Ok(()) => {
+                println!("FeatherTail installed and service started");
+                return;
+            }
+            Err(err) => {
+                eprintln!("service-install failed: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let config = match AppConfig::load_or_bootstrap(Path::new(&config_path)) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -53,14 +86,29 @@ async fn main() {
 
     init_logging(&config.daemon.log_level);
 
+    if !vnc_assets::is_proxmox_host() {
+        error!("FeatherTail agent only runs on proxmox hosts");
+        eprintln!("FeatherTail agent only runs on proxmox hosts");
+        std::process::exit(1);
+    }
+
+    if let Err(err) = vnc_assets::install_bundled_vnc_assets() {
+        error!(error = %err, "failed to install bundled noVNC assets");
+        eprintln!("failed to install bundled noVNC assets: {err}");
+        std::process::exit(1);
+    }
+
+    info!(target = "/usr/share/novnc-pve", "bundled noVNC assets installed");
+
     info!(
         name = %config.daemon.name,
         bind = %config.api.bind,
         pvesh = %config.proxmox.pvesh_bin,
+        pct = %config.proxmox.pct_bin,
         "starting proxmox daemon"
     );
 
-    let mut daemon = match Daemon::new(config) {
+    let mut daemon = match Daemon::new(config).await {
         Ok(d) => d,
         Err(err) => {
             error!(error = %err, "failed to initialize daemon");

@@ -7,6 +7,7 @@ use axum::response::Html;
 use axum::{Json, Router, routing::get};
 use utoipa::OpenApi;
 
+use crate::dhcp::DhcpService;
 use crate::proxmox::ProxmoxClient;
 
 #[derive(Clone)]
@@ -14,6 +15,7 @@ pub struct AppState {
     pub daemon_name: String,
     pub auth_token: String,
     pub proxmox: Arc<ProxmoxClient>,
+    pub dhcp: Option<Arc<DhcpService>>,
 }
 
 pub fn build_app(state: AppState) -> Router {

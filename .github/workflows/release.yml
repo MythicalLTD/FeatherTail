@@ -1,0 +1,30 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      - name: Prepare release asset
+        run: |
+          mkdir -p dist
+          cp target/release/feathertail dist/feathertail-linux-amd64
+      - name: Upload release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/feathertail-linux-amd64

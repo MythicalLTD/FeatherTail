@@ -12,3 +12,4 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 utoipa = "5"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }

@@ -1,0 +1,23 @@
+name: Dev Build
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  build-dev:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build debug binary
+        run: cargo build
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feathertail-dev-linux-amd64
+          path: target/debug/feathertail

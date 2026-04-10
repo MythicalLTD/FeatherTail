@@ -1,13 +1,26 @@
 [daemon]
 name = "feathertail-proxmox"
 poll_interval_secs = 15
-log_level = "info"
+log_level = "info-yapless"
 
 [proxmox]
 pvesh_bin = "pvesh"
+pct_bin = "pct"
 
 [api]
 bind = "0.0.0.0:8686"
 
 [auth]
 api_token = "change-me"
+
+[dhcp]
+enabled = true
+bind = "0.0.0.0:67"
+server_ip = "10.0.0.1"
+lease_time_secs = 86400
+database_path = "/var/lib/feathertail/dhcp.sqlite3"
+firewall_mode = "off"
+firewall_allow_macs = []
+firewall_deny_macs = []
+firewall_allow_vmids = []
+firewall_deny_vmids = []

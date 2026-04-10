@@ -7,6 +7,9 @@ install-buildkit:
 release:
 	cargo build --release
 
+test:
+	cargo test
+
 debug:
 	cargo build
 
@@ -17,4 +20,4 @@ run-release:
 	./target/release/feathertail
 
 run:
-	cargo run
+	cargo run -- --config ./feathertail.toml

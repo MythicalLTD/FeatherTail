@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 use crate::routes::AppState;
@@ -24,6 +25,16 @@ pub struct ApiServer {
     pub status: Option<String>,
     pub mem: Option<u64>,
     pub maxmem: Option<u64>,
+    pub dhcp: ApiServerDhcpStatus,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ApiServerDhcpStatus {
+    pub enabled: bool,
+    pub has_lease: bool,
+    pub lease_state: Option<String>,
+    pub ip: Option<String>,
+    pub lease_end: Option<i64>,
 }
 
 #[utoipa::path(
@@ -41,9 +52,48 @@ pub async fn list_servers(
 ) -> Result<Json<ServersResponse>, (StatusCode, Json<ErrorResponse>)> {
     let vms = state.proxmox.qemu_list().await.map_err(internal_error)?;
 
+    let lease_map = if let Some(dhcp) = state.dhcp.as_ref() {
+        if dhcp.enabled() {
+            let leases = dhcp.list_leases().await.map_err(internal_error)?;
+            let mut map = HashMap::new();
+            for lease in leases {
+                if let Some(vmid) = lease.vmid {
+                    map.insert(vmid, lease);
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let dhcp_enabled = state
+        .dhcp
+        .as_ref()
+        .map(|dhcp| dhcp.enabled())
+        .unwrap_or(false);
+
     let servers = vms
         .into_iter()
         .map(|vm| ApiServer {
+            dhcp: match lease_map.get(&vm.vmid) {
+                Some(lease) => ApiServerDhcpStatus {
+                    enabled: dhcp_enabled,
+                    has_lease: true,
+                    lease_state: Some(lease.state.clone()),
+                    ip: Some(lease.ip.clone()),
+                    lease_end: Some(lease.lease_end),
+                },
+                None => ApiServerDhcpStatus {
+                    enabled: dhcp_enabled,
+                    has_lease: false,
+                    lease_state: None,
+                    ip: None,
+                    lease_end: None,
+                },
+            },
             vmid: vm.vmid,
             name: vm.name,
             node: vm.node,
