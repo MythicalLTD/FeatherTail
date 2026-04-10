@@ -187,8 +187,16 @@ impl Daemon {
         loop {
             select! {
                 _ = ticker.tick() => {
-                    if let Err(err) = self.run_once().await {
-                        error!(error = %err, "daemon tick failed");
+                    select! {
+                        result = self.run_once() => {
+                            if let Err(err) = result {
+                                error!(error = %err, "daemon tick failed");
+                            }
+                        }
+                        _ = shutdown_signal() => {
+                            info!("shutdown signal received");
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_signal() => {

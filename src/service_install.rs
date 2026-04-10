@@ -22,25 +22,48 @@ pub fn install_service(source_config_path: &str) -> Result<(), DynError> {
 
     install_binary()?;
     install_config(source_config_path)?;
-    write_systemd_service()?;
+    write_systemd_service(INSTALL_BIN_PATH, INSTALL_CONFIG_PATH)?;
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", "--now", "feathertail.service"])?;
 
     Ok(())
 }
 
+pub fn refresh_managed_service_on_start(config_path: &str) -> Result<(), DynError> {
+    if !is_root()? {
+        return Ok(());
+    }
+
+    let current_exe = std::env::current_exe()?;
+    if current_exe != Path::new(INSTALL_BIN_PATH) {
+        return Ok(());
+    }
+
+    if !Path::new(SERVICE_PATH).exists() {
+        return Ok(());
+    }
+
+    write_systemd_service(INSTALL_BIN_PATH, config_path)?;
+    run_systemctl(&["daemon-reload"])?;
+    Ok(())
+}
+
 fn ensure_root() -> Result<(), DynError> {
+    if is_root()? {
+        return Ok(());
+    }
+
+    Err("service-install must be run as root".into())
+}
+
+fn is_root() -> Result<bool, DynError> {
     let output = Command::new("id").arg("-u").output()?;
     if !output.status.success() {
         return Err("failed to check user id".into());
     }
 
     let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if uid != "0" {
-        return Err("service-install must be run as root".into());
-    }
-
-    Ok(())
+    Ok(uid == "0")
 }
 
 fn install_binary() -> Result<(), DynError> {
@@ -79,10 +102,10 @@ fn install_config(source_config_path: &str) -> Result<(), DynError> {
     Ok(())
 }
 
-fn write_systemd_service() -> Result<(), DynError> {
+fn write_systemd_service(exec_path: &str, config_path: &str) -> Result<(), DynError> {
     let unit = format!(
-        "[Unit]\nDescription=FeatherTail DHCP + Proxmox Agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=3\nUser=root\nWorkingDirectory=/\n\n[Install]\nWantedBy=multi-user.target\n",
-        INSTALL_BIN_PATH, INSTALL_CONFIG_PATH
+        "[Unit]\nDescription=FeatherTail DHCP + Proxmox Agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=2\nTimeoutStartSec=20\nTimeoutStopSec=12\nKillMode=mixed\nUser=root\nWorkingDirectory=/\n\n[Install]\nWantedBy=multi-user.target\n",
+        exec_path, config_path
     );
 
     fs::write(SERVICE_PATH, unit)?;

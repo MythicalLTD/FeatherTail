@@ -109,6 +109,10 @@ async fn main() {
 
     init_logging(&config.daemon.log_level);
 
+    if let Err(err) = service_install::refresh_managed_service_on_start(&config_path) {
+        error!(error = %err, "failed to refresh managed systemd unit");
+    }
+
     if !vnc_assets::is_proxmox_host() {
         error!("FeatherTail agent only runs on proxmox hosts");
         eprintln!("FeatherTail agent only runs on proxmox hosts");
