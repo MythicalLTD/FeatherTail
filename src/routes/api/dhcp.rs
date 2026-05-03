@@ -246,7 +246,8 @@ fn bad_request_or_internal(err: impl std::fmt::Display) -> (StatusCode, Json<Err
     let message = err.to_string();
     if message.contains("invalid")
         || message.contains("must be")
-        || message.contains("outside configured subnet")
+        || message.contains("not on the same /")
+        || message.contains("cannot be combined under")
     {
         return (
             StatusCode::BAD_REQUEST,

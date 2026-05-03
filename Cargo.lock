@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "feathertail"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "axum",
  "serde",

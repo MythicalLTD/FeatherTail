@@ -140,11 +140,20 @@ impl DhcpService {
     pub async fn assign_static_lease(&self, input: AssignLeaseInput) -> Result<DhcpLease, DynError> {
         let mac = normalize_mac(&input.mac)?;
         let ip_addr = parse_ipv4(&input.ip)?;
-        let gateway = parse_ipv4(&input.gateway)?.to_string();
-        if input.cidr > 32 {
-            return Err("cidr must be between 0 and 32".into());
+        let gateway_addr = parse_ipv4(&input.gateway)?;
+        let effective_cidr =
+            effective_cidr_for_gateway_and_ip(ip_addr, gateway_addr, input.cidr)?;
+        if effective_cidr != input.cidr {
+            warn!(
+                requested_cidr = input.cidr,
+                effective_cidr,
+                vmid = ?input.vmid,
+                ip = %ip_addr,
+                gateway = %gateway_addr,
+                "dhcp assign: widened subnet by one bit so gateway and lease IP share one routed network",
+            );
         }
-        validate_ip_in_subnet(ip_addr, &gateway, input.cidr)?;
+        let gateway = gateway_addr.to_string();
 
         let dns_servers: Vec<String> = input
             .dns_servers
@@ -187,7 +196,7 @@ impl DhcpService {
         .bind(input.vmid.map(i64::from))
         .bind(input.node.clone())
         .bind(&gateway)
-        .bind(i64::from(input.cidr))
+        .bind(i64::from(effective_cidr))
         .bind(serde_json::to_string(&dns_servers)?)
         .bind(now)
         .bind(lease_end)
@@ -202,7 +211,7 @@ impl DhcpService {
             vmid: input.vmid,
             node: input.node,
             gateway,
-            cidr: input.cidr,
+            cidr: effective_cidr,
             dns_servers,
             lease_start: now,
             lease_end,
@@ -485,13 +494,62 @@ impl DhcpService {
     }
 }
 
-fn validate_ip_in_subnet(ip: Ipv4Addr, network_ref: &str, cidr: u8) -> Result<(), DynError> {
-    let base = parse_ipv4(network_ref)?;
-    let mask = if cidr == 0 { 0 } else { u32::MAX << (32 - cidr) };
-    if (ipv4_to_u32(ip) & mask) != (ipv4_to_u32(base) & mask) {
-        return Err("ip is outside configured subnet/cidr".into());
+fn subnet_mask_u32(cidr: u8) -> Result<u32, DynError> {
+    match cidr {
+        0 => Ok(0),
+        1..=32 => Ok(u32::MAX << u32::from(32_u8.saturating_sub(cidr))),
+        _ => Err("cidr must be between 0 and 32".into()),
     }
-    Ok(())
+}
+
+/// Returns `requested_cidr` when gateway and lease IP lie on one network for that mask, or —
+/// once — the next broader mask (`requested_cidr - 1`) when callers mis-state a routed `/23` as `/24`.
+/// Otherwise returns an error mentioning the largest workable `cidr` below the requested mask.
+fn effective_cidr_for_gateway_and_ip(
+    ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    requested_cidr: u8,
+) -> Result<u8, DynError> {
+    if requested_cidr > 32 {
+        return Err("cidr must be between 0 and 32".into());
+    }
+    if requested_cidr == 0 {
+        return Ok(0);
+    }
+    let ip_u = ipv4_to_u32(ip);
+    let gw_u = ipv4_to_u32(gateway);
+    let mask_r = subnet_mask_u32(requested_cidr)?;
+    if (ip_u & mask_r) == (gw_u & mask_r) {
+        return Ok(requested_cidr);
+    }
+
+    let one_looser = requested_cidr.saturating_sub(1);
+    if one_looser > 0 {
+        let mask_w = subnet_mask_u32(one_looser)?;
+        if (ip_u & mask_w) == (gw_u & mask_w) {
+            return Ok(one_looser);
+        }
+    }
+
+    let mut hint: Option<u8> = None;
+    for p in (1..requested_cidr).rev() {
+        let m = subnet_mask_u32(p)?;
+        if (ip_u & m) == (gw_u & m) {
+            hint = Some(p);
+            break;
+        }
+    }
+
+    let Some(largest_below) = hint else {
+        return Err(
+            format!("ip {ip} and gateway {gateway} cannot be combined under /{requested_cidr}; check addresses")
+                .into(),
+        );
+    };
+    Err(format!(
+        "ip {ip} and gateway {gateway} are not on the same /{requested_cidr} subnet; shortest shared network under your mask is /{largest_below} (try \"cidr\": {largest_below})"
+    )
+    .into())
 }
 
 fn parse_dhcp_request(packet: &[u8]) -> Option<ParsedDhcpRequest> {
@@ -859,11 +917,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_ip_in_subnet_rejects_outside_range() {
-        let inside = validate_ip_in_subnet(Ipv4Addr::new(193, 34, 77, 50), "193.34.77.1", 24);
-        assert!(inside.is_ok());
+    fn effective_cidr_keeps_matching_gateway_network() {
+        let ip = Ipv4Addr::new(193, 34, 77, 50);
+        let gw = Ipv4Addr::new(193, 34, 77, 1);
+        assert_eq!(
+            effective_cidr_for_gateway_and_ip(ip, gw, 24).unwrap(),
+            24
+        );
+    }
 
-        let outside = validate_ip_in_subnet(Ipv4Addr::new(193, 34, 78, 50), "193.34.77.1", 24);
-        assert!(outside.is_err());
+    #[test]
+    fn effective_cidr_widens_one_bit_when_routed_supernet_matches() {
+        let ip = Ipv4Addr::new(212, 87, 213, 115);
+        let gw = Ipv4Addr::new(212, 87, 212, 1);
+        assert_eq!(
+            effective_cidr_for_gateway_and_ip(ip, gw, 24).unwrap(),
+            23
+        );
+    }
+
+    #[test]
+    fn effective_cidr_rejects_far_mismatch() {
+        let ip = Ipv4Addr::new(193, 34, 78, 50);
+        let gw = Ipv4Addr::new(193, 34, 77, 1);
+        assert!(effective_cidr_for_gateway_and_ip(ip, gw, 24).is_err());
     }
 }
