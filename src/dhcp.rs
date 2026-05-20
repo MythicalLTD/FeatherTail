@@ -271,6 +271,32 @@ impl DhcpService {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Extends an active lease in the database when a client ACKs (renew/rebind).
+    pub async fn renew_lease_by_mac(&self, mac: &str) -> Result<Option<DhcpLease>, DynError> {
+        let normalized = normalize_mac(mac)?;
+        let now = now_unix();
+        let lease_end =
+            now + i64::try_from(self.config.lease_time_secs).unwrap_or(86_400);
+
+        let result = sqlx::query(
+            "UPDATE dhcp_leases SET lease_start = ?, lease_end = ?, state = 'active', updated_at = ? \
+             WHERE mac = ? AND state = 'active'",
+        )
+        .bind(now)
+        .bind(lease_end)
+        .bind(now)
+        .bind(&normalized)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        debug!(mac = %normalized, lease_end, "dhcp lease renewed in database");
+        self.find_lease_by_mac(&normalized).await
+    }
+
     pub async fn run_listener(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), DynError> {
         if !self.config.enabled {
             info!("dhcp listener disabled by config");
@@ -402,11 +428,21 @@ impl DhcpService {
             return Ok(());
         }
 
+        let lease = if response_type == DHCP_ACK {
+            match self.renew_lease_by_mac(&lease.mac).await? {
+                Some(refreshed) => refreshed,
+                other => other.unwrap_or(lease),
+            }
+        } else {
+            lease
+        };
+
         let response = build_dhcp_response(
             &request,
             &lease,
             response_type,
             parse_ipv4(&self.config.server_ip)?,
+            self.config.lease_time_secs,
         )?;
         let target = resolve_dhcp_target(&request, src);
         socket.send_to(&response, target).await?;
@@ -638,16 +674,18 @@ fn build_dhcp_response(
     lease: &DhcpLease,
     response_type: u8,
     server_ip: Ipv4Addr,
+    configured_lease_secs: u64,
 ) -> Result<Vec<u8>, DynError> {
     let yiaddr = parse_ipv4(&lease.ip)?;
     let gateway = parse_ipv4(&lease.gateway)?;
     let subnet_mask = cidr_to_mask(lease.cidr);
 
     let now = now_unix();
+    let configured = i64::try_from(configured_lease_secs).unwrap_or(86_400);
     let mut lease_time = if lease.lease_end > now {
         lease.lease_end - now
     } else {
-        300
+        configured
     };
     if lease_time < 60 {
         lease_time = 60;
@@ -868,6 +906,39 @@ mod tests {
     }
 
     #[test]
+    fn build_dhcp_response_uses_configured_lease_when_db_expired() {
+        let packet = base_packet_with_options(&[53, 1, DHCP_DISCOVER, 255]);
+        let parsed = parse_dhcp_request(&packet).expect("packet should parse");
+
+        let lease = DhcpLease {
+            mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+            ip: "10.0.0.10".to_owned(),
+            hostname: None,
+            vmid: None,
+            node: None,
+            gateway: "10.0.0.1".to_owned(),
+            cidr: 24,
+            dns_servers: vec![],
+            lease_start: 0,
+            lease_end: 1,
+            state: "active".to_owned(),
+            static_lease: true,
+        };
+
+        let response = build_dhcp_response(
+            &parsed,
+            &lease,
+            DHCP_OFFER,
+            Ipv4Addr::new(10, 0, 0, 1),
+            7200,
+        )
+        .expect("response should build");
+
+        let lease_secs = 7200u32.to_be_bytes();
+        assert!(response.windows(6).any(|w| w == [51, 4, lease_secs[0], lease_secs[1], lease_secs[2], lease_secs[3]]));
+    }
+
+    #[test]
     fn build_dhcp_response_includes_router_dns_and_mask() {
         let packet = base_packet_with_options(&[53, 1, DHCP_DISCOVER, 255]);
         let parsed = parse_dhcp_request(&packet).expect("packet should parse");
@@ -887,8 +958,14 @@ mod tests {
             static_lease: true,
         };
 
-        let response = build_dhcp_response(&parsed, &lease, DHCP_OFFER, Ipv4Addr::new(193, 34, 77, 2))
-            .expect("response should build");
+        let response = build_dhcp_response(
+            &parsed,
+            &lease,
+            DHCP_OFFER,
+            Ipv4Addr::new(193, 34, 77, 2),
+            86_400,
+        )
+        .expect("response should build");
 
         assert!(response.windows(3).any(|w| w == [53, 1, DHCP_OFFER]));
         assert!(response.windows(6).any(|w| w == [1, 4, 255, 255, 255, 0]));
