@@ -1,0 +1,68 @@
+name: "${NFPM_NAME}"
+arch: "${NFPM_ARCH}"
+platform: linux
+version: "${NFPM_VERSION}"
+section: admin
+priority: optional
+maintainer: MythicalSystems <support@mythicalsystems.org>
+vendor: MythicalSystems
+description: |-
+  FeatherTail Proxmox host agent for FeatherPanel.
+   FeatherTail provides DHCP lease management tied to VM identity, Proxmox VM
+   and container helpers, and noVNC asset installation. Designed to run only
+   on Proxmox VE hosts with systemd integration for production deployments.
+homepage: https://github.com/mythicalltd/feathertail
+license: MIT
+changelog: packaging/changelog.yaml
+depends:
+  - systemd
+  - ca-certificates
+  # Only installable on Proxmox VE nodes (comes from the Proxmox apt repos).
+  - pve-manager
+recommends:
+  - curl
+  - gnupg
+  - qemu-server
+conflicts:
+  - "${NFPM_CONFLICT}"
+replaces:
+  - "${NFPM_CONFLICT}"
+provides:
+  - feathertail-daemon
+
+deb:
+  fields:
+    Bugs: https://github.com/mythicalltd/feathertail/issues
+    Vcs-Browser: https://github.com/mythicalltd/feathertail
+    Vcs-Git: https://github.com/mythicalltd/feathertail.git
+
+contents:
+  - src: dist/feathertail
+    dst: /usr/local/bin/feathertail
+    file_info:
+      mode: 0755
+  - src: packaging/feathertail.service
+    dst: /lib/systemd/system/feathertail.service
+    file_info:
+      mode: 0644
+  - src: packaging/feathertail.toml
+    dst: /etc/feathertail/feathertail.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: packaging/feathertail.metainfo.xml
+    dst: /usr/share/metainfo/org.mythicalsystems.FeatherTail.metainfo.xml
+    file_info:
+      mode: 0644
+  - src: packaging/copyright
+    dst: /usr/share/doc/feathertail/copyright
+    file_info:
+      mode: 0644
+  - src: packaging/README.Debian
+    dst: /usr/share/doc/feathertail/README.Debian
+    file_info:
+      mode: 0644
+
+scripts:
+  preinstall: packaging/preinstall.sh
+  postinstall: packaging/postinstall.sh

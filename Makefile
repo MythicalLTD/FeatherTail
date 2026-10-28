@@ -21,3 +21,9 @@ run-release:
 
 run:
 	cargo run -- --config ./feathertail.toml
+
+deb:
+	./scripts/build-deb.sh
+
+deb-dev:
+	PACKAGE_CHANNEL=dev ./scripts/build-deb.sh

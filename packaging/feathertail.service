@@ -1,0 +1,23 @@
+[Unit]
+Description=FeatherTail DHCP + Proxmox Agent
+Documentation=https://github.com/mythicalltd/feathertail
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/pve
+ConditionPathExists=/etc/feathertail/feathertail.toml
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/
+ExecStart=/usr/local/bin/feathertail --config /etc/feathertail/feathertail.toml
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=12
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

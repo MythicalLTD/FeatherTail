@@ -2,6 +2,9 @@ target/
 debug/
 release/
 rls/
+dist/
 *.o
 wings
 feathertail
+packaging/changelog.yaml
+packaging/feathertail.metainfo.xml

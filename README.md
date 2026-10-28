@@ -1,73 +1,60 @@
 # FeatherTail
 
-FeatherTail is a Rust daemon for Proxmox hosts that provides:
+Proxmox host agent for FeatherPanel. Installs **only via APT** on Proxmox VE nodes (`Depends: pve-manager`).
 
-- DHCP lease management API tied to VM identity
-- DHCP packet responses (OFFER/ACK/NAK/RELEASE handling)
-- Proxmox VM and container API helpers
-- noVNC helper asset installation on startup
+Provides DHCP lease management by VMID, Proxmox VM/LXC helpers, an HTTP API, and bundled noVNC assets under `/usr/share/novnc-pve`.
 
-FeatherTail is designed to run only on Proxmox hosts.
+| Package | Channel | When |
+|---------|---------|------|
+| `feathertail` | **stable** | GitHub releases (`v*` tags) |
+| `feathertail-dev` | **nightly** | Every commit to `main` |
 
-## Features
+These packages conflict; installing one replaces the other.
 
-- Proxmox host guard: exits if host is not Proxmox
-- Bundled noVNC assets copied to /usr/share/novnc-pve
-- DHCP leases assigned by VMID with per-lease network settings
-- DHCP firewall modes: off, blocklist, allowlist
-- API docs at /docs and OpenAPI at /openapi.json
-- LXC root password endpoint
-
-## Requirements
-
-- Linux host
-- Proxmox VE host
-- root privileges (needed for binding UDP 67, system paths, service install)
-- systemd (for service-install command)
-
-## Quick Start (Binary Install)
-
-1. Download binary from releases:
+## Install (Proxmox host)
 
 ```bash
-wget -O feathertail https://github.com/mythicalltd/feathertail/releases/latest/download/feathertail-linux-amd64
-chmod +x feathertail
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.mythicalsystems.org/repository/keys/public.gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/mythicalsystems.gpg
+sudo chmod a+r /etc/apt/keyrings/mythicalsystems.gpg
+
+ARCH="$(dpkg --print-architecture)"
+echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/mythicalsystems.gpg] https://apt.mythicalsystems.org/repository/MythicalSystems/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/mythicalsystems.list
+
+sudo apt-get update
+sudo apt-get install -y feathertail
+# nightly:
+# sudo apt-get install -y feathertail-dev
 ```
 
-2. Install as service:
+Or use the FeatherPanel installer on the Proxmox node (menu **[6] FeatherTail**, APT-only).
+
+## After install
+
+1. Edit `/etc/feathertail/feathertail.toml` — set a strong `api_token` and your DHCP settings.
+2. Service is enabled on Proxmox hosts automatically; otherwise:
 
 ```bash
-sudo ./feathertail service-install
-```
-
-What this does:
-
-- copies binary to /usr/local/bin/feathertail
-- creates config at /etc/feathertail/feathertail.toml (or copies your current one)
-- creates systemd unit at /etc/systemd/system/feathertail.service
-- runs systemctl daemon-reload
-- runs systemctl enable --now feathertail.service
-
-3. Check status:
-
-```bash
+sudo systemctl enable --now feathertail
 systemctl status feathertail
 journalctl -u feathertail -f
 ```
 
-## Development Setup
+## Upgrade
 
 ```bash
-make install-builtkit
-cargo build
-cargo test
-cargo run -- --config ./feathertail.toml
+sudo apt-get update && sudo apt-get install --only-upgrade feathertail
+# or
+sudo apt-get update && sudo apt-get install --only-upgrade feathertail-dev
 ```
-
 
 ## Configuration
 
-Example config:
+Default path: `/etc/feathertail/feathertail.toml` (`config|noreplace` on upgrade).
 
 ```toml
 [daemon]
@@ -98,20 +85,14 @@ firewall_allow_vmids = []
 firewall_deny_vmids = []
 ```
 
-## API Overview
+## API
 
-Base path: /api/v1
+Base path: `/api/v1` — docs at `/docs`, OpenAPI at `/openapi.json`.
 
-- GET /dhcp/leases
-- POST /dhcp/leases
-- DELETE /dhcp/leases/vm/{vmid}
-- GET /servers
-- GET /containers
-- POST /containers/{vmid}/root-password
-- GET /proxmox/version
-- GET /proxmox/nodes
-
-## DHCP Lease Example
+- `GET/POST /dhcp/leases`, `DELETE /dhcp/leases/vm/{vmid}`
+- `GET /servers`, `GET /containers`
+- `POST /containers/{vmid}/root-password`
+- `GET /proxmox/version`, `GET /proxmox/nodes`
 
 ```bash
 curl -X POST http://127.0.0.1:8686/api/v1/dhcp/leases \
@@ -128,20 +109,8 @@ curl -X POST http://127.0.0.1:8686/api/v1/dhcp/leases \
   }'
 ```
 
-## CI/CD Workflows
-
-This repository includes GitHub Actions:
-
-- CI: .github/workflows/ci.yml
-  - runs cargo test and cargo check on push and PR
-- Dev Build: .github/workflows/dev-build.yml
-  - builds debug binary on dev branch pushes
-  - uploads artifact feathertail-dev-linux-amd64
-- Release Build: .github/workflows/release.yml
-  - builds release binary on tags like v1.0.0
-  - publishes asset feathertail-linux-amd64 to release
-
 ## Notes
 
-- The daemon must run as root for DHCP UDP 67 and system integration tasks.
-- FeatherTail exits early on non-Proxmox hosts by design.
+- Requires Proxmox VE (`pve-manager`). Non-Proxmox hosts cannot satisfy the dependency.
+- Runs as root (DHCP UDP 67, system paths).
+- Must be installed on the Proxmox **node**, not inside a guest VM without PVE packages.
