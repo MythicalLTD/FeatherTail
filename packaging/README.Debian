@@ -11,11 +11,13 @@ noVNC assets, and exposes an HTTP API for the panel.
 Quick start
 -----------
 
-1. Edit the configuration:
+1. Prefer the FeatherPanel VDS node setup command (writes `api_token` via
+   `FP_TAIL_TOKEN`). Otherwise edit the configuration:
 
        sudo nano /etc/feathertail/feathertail.toml
 
-   Set a strong `api_token` and your DHCP network settings before exposing the API.
+   Set a strong `api_token` (never leave `change-me`). Leave DHCP disabled
+   until you intend this host to serve leases; then set network settings.
 
 2. Enable and start the service (done automatically on Proxmox hosts):
 

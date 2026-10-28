@@ -13,7 +13,7 @@ use std::path::Path;
 
 use config::AppConfig;
 use daemon::Daemon;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn init_logging(default_level: &str) {
@@ -108,6 +108,17 @@ async fn main() {
     }
 
     init_logging(&config.daemon.log_level);
+
+    if config.auth.api_token.trim().is_empty() || config.auth.api_token.trim() == "change-me" {
+        warn!(
+            config = %config_path,
+            "auth.api_token is still the default 'change-me' — set a strong token (FeatherPanel setup command / FP_TAIL_TOKEN) before exposing the API"
+        );
+        eprintln!(
+            "WARNING: FeatherTail auth.api_token is still 'change-me'. Configure a panel-issued token before exposing port {}.",
+            config.api.bind
+        );
+    }
 
     if let Err(err) = service_install::refresh_managed_service_on_start(&config_path) {
         error!(error = %err, "failed to refresh managed systemd unit");

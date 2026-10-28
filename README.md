@@ -35,7 +35,7 @@ Or use the FeatherPanel installer on the Proxmox node (menu **[6] FeatherTail**,
 
 ## After install
 
-1. Edit `/etc/feathertail/feathertail.toml` — set a strong `api_token` and your DHCP settings.
+1. Prefer the FeatherPanel VDS node **FeatherTail** tab setup command (sets `api_token` via `FP_TAIL_TOKEN`). Otherwise edit `/etc/feathertail/feathertail.toml` — never leave `change-me`. DHCP stays **disabled** by default until you enable it intentionally.
 2. Service is enabled on Proxmox hosts automatically; otherwise:
 
 ```bash
@@ -73,7 +73,7 @@ bind = "0.0.0.0:8686"
 api_token = "change-me"
 
 [dhcp]
-enabled = true
+enabled = false
 bind = "0.0.0.0:67"
 server_ip = "10.0.0.1"
 lease_time_secs = 86400

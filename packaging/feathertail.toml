@@ -1,20 +1,24 @@
 [daemon]
 name = "feathertail-proxmox"
 poll_interval_secs = 15
-log_level = "info-yapless"
+log_level = "info"
 
 [proxmox]
 pvesh_bin = "pvesh"
 pct_bin = "pct"
 
 [api]
+# Reachable from FeatherPanel by default. Firewall-restrict to the panel IP.
 bind = "0.0.0.0:8686"
 
 [auth]
+# Overwritten by the FeatherPanel installer when FP_TAIL_TOKEN is set.
+# Do not leave change-me on a production node.
 api_token = "change-me"
 
 [dhcp]
-enabled = true
+# Keep disabled until you intentionally run DHCP on this node/bridge.
+enabled = false
 bind = "0.0.0.0:67"
 server_ip = "10.0.0.1"
 lease_time_secs = 86400
