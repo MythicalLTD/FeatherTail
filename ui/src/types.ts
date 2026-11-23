@@ -118,6 +118,19 @@ export interface LeaseView extends DhcpLease {
   nic_key: string | null
   nic_bridge: string | null
   pool_bridge: string | null
+  last_offer_at: number | null
+  last_ack_at: number | null
+  acked_ip: string | null
+}
+
+export interface LeaseCheck {
+  mac: string
+  ip: string
+  ping_ok: boolean
+  ping_ms: number | null
+  neighbor_mac: string | null
+  mac_matches: boolean | null
+  checked_at: number
 }
 
 export interface CreateLeaseRequest {

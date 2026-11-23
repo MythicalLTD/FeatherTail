@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/admin/leases", get(admin::list_leases).post(admin::create_lease))
         .route("/admin/leases/{mac}", delete(admin::delete_lease))
         .route("/admin/leases/{mac}/renew", post(admin::renew_lease))
+        .route("/admin/leases/{mac}/check", post(admin::check_lease))
         .route("/admin/settings", get(admin::get_settings).put(admin::update_settings))
         .route("/admin/restart", post(admin::restart))
         .route("/auth/password", post(auth::change_password))

@@ -430,10 +430,13 @@ pub struct LeaseView {
     pub nic_key: Option<String>,
     pub nic_bridge: Option<String>,
     pub pool_bridge: Option<String>,
+    #[serde(flatten)]
+    pub activity: crate::dhcp::LeaseActivity,
 }
 
 pub async fn list_leases(State(state): State<AppState>) -> ApiResult<Vec<LeaseView>> {
     let leases = state.store.list_leases().await.map_err(classify)?;
+    let mut activity = state.store.lease_activity().await.map_err(classify)?;
     let pool = state.store.list_pool().await.map_err(classify)?;
     let guests = inventory::list_guests(&state.pvesh_bin).await;
     let pool_by_ip: HashMap<&str, &PoolIp> = pool.iter().map(|p| (p.ip.as_str(), p)).collect();
@@ -452,6 +455,7 @@ pub async fn list_leases(State(state): State<AppState>) -> ApiResult<Vec<LeaseVi
                 nic_key: nic.map(|n| n.key.clone()),
                 nic_bridge: nic.and_then(|n| n.bridge.clone()),
                 pool_bridge: pool_by_ip.get(lease.ip.as_str()).map(|p| p.bridge.clone()),
+                activity: activity.remove(&lease.mac).unwrap_or_default(),
                 lease,
             }
         })
@@ -623,6 +627,89 @@ pub async fn renew_lease(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no lease for {mac}")))?;
     info!(mac = %lease.mac, ip = %lease.ip, "admin ui renewed lease");
     Ok(Json(lease))
+}
+
+#[derive(Serialize)]
+pub struct LeaseCheck {
+    pub mac: String,
+    pub ip: String,
+    /// The IP answered ICMP echo from this host.
+    pub ping_ok: bool,
+    pub ping_ms: Option<f64>,
+    /// MAC the host's neighbour (ARP) table has for the IP, if any.
+    pub neighbor_mac: Option<String>,
+    /// The neighbour MAC is the lease's MAC → that exact VM NIC is using the IP.
+    pub mac_matches: Option<bool>,
+    pub checked_at: i64,
+}
+
+/// Probes whether the guest is actually using its leased IP (ping + ARP neighbour lookup).
+pub async fn check_lease(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> ApiResult<LeaseCheck> {
+    let lease = state
+        .store
+        .find_lease_by_mac(&mac)
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no lease for {mac}")))?;
+    let ip: Ipv4Addr = lease.ip.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "lease has an invalid ip"))?;
+    let ip_s = ip.to_string();
+
+    let ping = tokio::process::Command::new("ping")
+        .args(["-c", "2", "-i", "0.2", "-W", "1", "-n", "-q", &ip_s])
+        .output()
+        .await;
+    let (ping_ok, ping_ms) = match ping {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // "rtt min/avg/max/mdev = 0.231/0.250/0.270/0.019 ms"
+            let avg = text
+                .lines()
+                .find(|l| l.contains("min/avg/max"))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|v| v.trim().split('/').nth(1))
+                .and_then(|v| v.parse::<f64>().ok());
+            (out.status.success(), avg)
+        }
+        Err(_) => (false, None),
+    };
+
+    let neighbor_mac = match tokio::process::Command::new("ip")
+        .args(["-4", "neigh", "show", &ip_s])
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines().find_map(|line| {
+                let mut it = line.split_whitespace();
+                while let Some(tok) = it.next() {
+                    if tok == "lladdr" {
+                        return it.next().map(|m| m.to_ascii_lowercase());
+                    }
+                }
+                None
+            })
+        }
+        Err(_) => None,
+    };
+    let mac_matches = neighbor_mac.as_ref().map(|m| m.eq_ignore_ascii_case(&lease.mac));
+
+    info!(mac = %lease.mac, ip = %ip_s, ping_ok, ?neighbor_mac, ?mac_matches, "admin ui checked lease");
+    Ok(Json(LeaseCheck {
+        mac: lease.mac,
+        ip: ip_s,
+        ping_ok,
+        ping_ms,
+        neighbor_mac,
+        mac_matches,
+        checked_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default(),
+    }))
 }
 
 // ---------------------------------------------------------------------------------------

@@ -1,8 +1,8 @@
-import { useMemo, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
 import { api, downloadCsv, enc, errorMessage, fmtRelative, fmtTime, ipToInt, refreshAll, splitList } from '../api.ts'
 import { Copy, Empty, ErrorBox, Modal, PageHead, SearchInput, Seg, Skeleton, StatusPill, useConfirm, useLoader, useToast } from '../components.tsx'
 import { navigate } from '../router.ts'
-import type { CreateLeaseRequest, DhcpLease, LeaseView, PageProps } from '../types.ts'
+import type { CreateLeaseRequest, DhcpLease, LeaseCheck, LeaseView, PageProps } from '../types.ts'
 
 export default function Leases({ params }: PageProps) {
   const toast = useToast()
@@ -52,6 +52,30 @@ export default function Leases({ params }: PageProps) {
     setSelected(new Set())
     refreshAll()
   }
+
+  const [checks, setChecks] = useState<Record<string, LeaseCheck | 'pending'>>({})
+  const checkOne = async (l: LeaseView) => {
+    setChecks((c) => ({ ...c, [l.mac]: 'pending' }))
+    try {
+      const res = await api.post<LeaseCheck>(`/admin/leases/${enc(l.mac)}/check`, {})
+      setChecks((c) => ({ ...c, [l.mac]: res }))
+    } catch (e) {
+      setChecks((c) => {
+        const next = { ...c }
+        delete next[l.mac]
+        return next
+      })
+      toast(<>{l.ip}: {errorMessage(e)}</>, 'danger')
+    }
+  }
+  // Probe every active lease once when the page opens.
+  const autoChecked = useRef(false)
+  useEffect(() => {
+    if (!data || autoChecked.current) return
+    autoChecked.current = true
+    data.filter((l) => l.state === 'active').forEach((l) => void checkOne(l))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data])
 
   const renewMany = async (list: LeaseView[]) => {
     let failed = 0
@@ -157,6 +181,7 @@ export default function Leases({ params }: PageProps) {
                   <th>Bridge</th>
                   <th>Gateway</th>
                   <th>State</th>
+                  <th>VM</th>
                   <th>Expires</th>
                   <th />
                 </tr>
@@ -211,6 +236,9 @@ export default function Leases({ params }: PageProps) {
                       </td>
                       <td>
                         <StatusPill status={l.state} />
+                      </td>
+                      <td>
+                        <LeaseHealth lease={l} check={checks[l.mac]} onCheck={() => checkOne(l)} />
                       </td>
                       <td className="small text-body-secondary" title={fmtTime(l.lease_end)}>
                         {fmtRelative(l.lease_end)}
@@ -273,6 +301,80 @@ export default function Leases({ params }: PageProps) {
         />
       )}
     </>
+  )
+}
+
+/**
+ * Two signals:
+ *  - DHCP: did the VM request exactly this IP and get an ACK since the lease was (re)assigned?
+ *  - Network: does the IP answer from this host, and is the ARP MAC the VM's own NIC?
+ */
+function LeaseHealth({ lease: l, check, onCheck }: { lease: LeaseView; check?: LeaseCheck | 'pending'; onCheck: () => void }) {
+  const acked = l.acked_ip === l.ip && l.last_ack_at != null && l.last_ack_at >= l.lease_start
+  const offeredOnly = !acked && l.last_offer_at != null && l.last_offer_at >= l.lease_start
+
+  const dhcp = acked ? (
+    <span className="badge text-bg-success" title={`DHCP ACK sent ${fmtTime(l.last_ack_at!)}`}>
+      <i className="bi bi-check2-circle me-1" />
+      took IP · {fmtRelative(l.last_ack_at!)}
+    </span>
+  ) : offeredOnly ? (
+    <span className="badge text-bg-warning" title={`Offered ${fmtTime(l.last_offer_at!)}, but the VM never requested it`}>
+      <i className="bi bi-hourglass-split me-1" />
+      offered, not taken
+    </span>
+  ) : (
+    <span
+      className="badge border text-body-secondary"
+      title={l.last_ack_at ? `Last ACK ${fmtTime(l.last_ack_at)}${l.acked_ip && l.acked_ip !== l.ip ? ` for ${l.acked_ip}` : ''}` : 'No DHCP request seen yet'}
+    >
+      <i className="bi bi-clock me-1" />
+      waiting for VM
+    </span>
+  )
+
+  let net: ReactNode
+  if (check === 'pending') {
+    net = <span className="spinner-border spinner-border-sm text-body-secondary" />
+  } else if (check) {
+    if (check.mac_matches === false) {
+      net = (
+        <span className="badge text-bg-danger" title={`ARP says ${check.ip} is at ${check.neighbor_mac}, not ${l.mac}`}>
+          <i className="bi bi-exclamation-octagon me-1" />
+          other MAC!
+        </span>
+      )
+    } else if (check.ping_ok || check.mac_matches) {
+      const parts = [check.ping_ok ? `ping ${check.ping_ms != null ? check.ping_ms.toFixed(1) + ' ms' : 'ok'}` : 'no ping', check.mac_matches ? 'ARP MAC matches' : null]
+      net = (
+        <span className="badge text-bg-success" title={parts.filter(Boolean).join(' · ')}>
+          <i className="bi bi-broadcast me-1" />
+          in use{check.mac_matches ? ' ✓MAC' : ''}
+        </span>
+      )
+    } else {
+      net = (
+        <span className="badge text-bg-secondary" title="No ping reply and no ARP entry from this host (the VM may block ICMP, or the IP isn't up)">
+          <i className="bi bi-wifi-off me-1" />
+          not responding
+        </span>
+      )
+    }
+  }
+
+  return (
+    <div className="d-flex align-items-center gap-1 flex-wrap">
+      {dhcp}
+      {net}
+      <button
+        className="btn btn-sm btn-link p-0 text-body-secondary"
+        title="Check if the VM is using this IP (ping + ARP)"
+        onClick={onCheck}
+        disabled={check === 'pending'}
+      >
+        <i className="bi bi-search" />
+      </button>
+    </div>
   )
 }
 

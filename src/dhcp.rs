@@ -41,6 +41,13 @@ pub struct DhcpLease {
     pub static_lease: bool,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LeaseActivity {
+    pub last_offer_at: Option<i64>,
+    pub last_ack_at: Option<i64>,
+    pub acked_ip: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AssignLeaseInput {
     pub mac: String,
@@ -1022,7 +1029,48 @@ impl DhcpService {
             "dhcp response sent"
         );
 
+        if let Err(e) = self.record_response(&lease.mac, &lease.ip, response_type).await {
+            warn!(mac = %lease.mac, error = %e, "failed to record dhcp activity");
+        }
+
         Ok(())
+    }
+
+    /// Remembers the last OFFER / ACK we sent to a MAC so the UI can tell whether the guest
+    /// actually took its address (an ACK means the client requested exactly that IP).
+    async fn record_response(&self, mac: &str, ip: &str, response_type: u8) -> Result<(), DynError> {
+        let now = now_unix();
+        let q = if response_type == DHCP_ACK {
+            sqlx::query("UPDATE dhcp_leases SET last_ack_at = ?, acked_ip = ? WHERE mac = ?")
+                .bind(now)
+                .bind(ip)
+                .bind(mac)
+        } else {
+            sqlx::query("UPDATE dhcp_leases SET last_offer_at = ? WHERE mac = ?")
+                .bind(now)
+                .bind(mac)
+        };
+        q.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Per-MAC DHCP activity (last offer, last ack and the IP that was acked).
+    pub async fn lease_activity(&self) -> Result<std::collections::HashMap<String, LeaseActivity>, DynError> {
+        let rows = sqlx::query("SELECT mac, last_offer_at, last_ack_at, acked_ip FROM dhcp_leases")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            out.insert(
+                row.try_get::<String, _>("mac")?,
+                LeaseActivity {
+                    last_offer_at: row.try_get("last_offer_at")?,
+                    last_ack_at: row.try_get("last_ack_at")?,
+                    acked_ip: row.try_get("acked_ip")?,
+                },
+            );
+        }
+        Ok(out)
     }
 
     fn host_allowed(&self, mac: &str, vmid: Option<u32>) -> bool {
@@ -1082,6 +1130,15 @@ impl DhcpService {
             .execute(&self.pool)
             .await;
         let _ = sqlx::query("ALTER TABLE dhcp_leases ADD COLUMN dns_servers TEXT NOT NULL DEFAULT '[]'")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE dhcp_leases ADD COLUMN last_offer_at INTEGER")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE dhcp_leases ADD COLUMN last_ack_at INTEGER")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE dhcp_leases ADD COLUMN acked_ip TEXT")
             .execute(&self.pool)
             .await;
 
