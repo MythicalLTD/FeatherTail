@@ -220,10 +220,9 @@ impl DynamicRange {
         if s > e {
             return Err(format!("invalid range {start}-{end}: start is after end").into());
         }
-        let net = ipv4_to_u32(gateway) & mask;
-        if s & mask != net || e & mask != net {
+        if s & mask != e & mask {
             return Err(format!(
-                "invalid range {start}-{end}: not inside {gateway}/{}",
+                "invalid range {start}-{end}: start and end are not in the same /{}",
                 raw.cidr
             )
             .into());
@@ -1109,25 +1108,34 @@ fn effective_cidr_for_gateway_and_ip(
         }
     }
 
-    let mut hint: Option<u8> = None;
-    for p in (1..requested_cidr).rev() {
-        let m = subnet_mask_u32(p)?;
-        if (ip_u & m) == (gw_u & m) {
-            hint = Some(p);
-            break;
-        }
-    }
+    // Gateway outside the client's subnet (common with routed /28-/32 blocks, e.g.
+    // 212.87.213.113/28 via 212.87.212.1). Keep the real mask; the DHCP reply adds
+    // classless static routes (option 121) so the client reaches the gateway on-link.
+    debug!(
+        %ip,
+        %gateway,
+        cidr = requested_cidr,
+        "gateway outside the subnet: will be sent as an on-link route"
+    );
+    Ok(requested_cidr)
+}
 
-    let Some(largest_below) = hint else {
-        return Err(
-            format!("ip {ip} and gateway {gateway} cannot be combined under /{requested_cidr}; check addresses")
-                .into(),
-        );
-    };
-    Err(format!(
-        "ip {ip} and gateway {gateway} are not on the same /{requested_cidr} subnet; shortest shared network under your mask is /{largest_below} (try \"cidr\": {largest_below})"
-    )
-    .into())
+/// True when `gateway` is not inside `ip`/`cidr` and needs an explicit on-link route.
+fn gateway_needs_onlink_route(ip: Ipv4Addr, gateway: Ipv4Addr, cidr: u8) -> bool {
+    let mask = subnet_mask_u32(cidr).unwrap_or(u32::MAX);
+    gateway != Ipv4Addr::UNSPECIFIED && (ipv4_to_u32(ip) & mask) != (ipv4_to_u32(gateway) & mask)
+}
+
+/// RFC 3442 classless static routes: `gateway/32` directly on the link, then the default
+/// route via the gateway. Clients that understand option 121 ignore option 3.
+fn onlink_gateway_routes(gateway: Ipv4Addr) -> Vec<u8> {
+    let mut routes = Vec::with_capacity(14);
+    routes.push(32);
+    routes.extend_from_slice(&gateway.octets());
+    routes.extend_from_slice(&[0, 0, 0, 0]);
+    routes.push(0);
+    routes.extend_from_slice(&gateway.octets());
+    routes
 }
 
 fn parse_dhcp_request(packet: &[u8]) -> Option<ParsedDhcpRequest> {
@@ -1251,6 +1259,11 @@ fn build_dhcp_response(
     push_option(&mut out, 54, &server_ip.octets());
     push_option(&mut out, 1, &subnet_mask.octets());
     push_option(&mut out, 3, &gateway.octets());
+    if gateway_needs_onlink_route(yiaddr, gateway, lease.cidr) {
+        let routes = onlink_gateway_routes(gateway);
+        push_option(&mut out, 121, &routes);
+        push_option(&mut out, 249, &routes);
+    }
 
     let dns_raw: Vec<u8> = lease
         .dns_servers
@@ -1437,7 +1450,8 @@ mod tests {
         assert_eq!(ok.server_identifier(), Some(Ipv4Addr::new(10, 0, 0, 1)));
 
         assert!(pool_ip("10.0.0.1", "vmbr1").validate().is_err(), "gateway itself");
-        assert!(pool_ip("10.0.5.4", "vmbr1").validate().is_err(), "other subnet");
+        // Gateway in another subnet is allowed (sent as an on-link route).
+        assert!(pool_ip("10.0.5.4", "vmbr1").validate().is_ok(), "routed gateway");
         assert!(pool_ip("10.0.0.4", "vmbr1; rm -rf").validate().is_err(), "bad bridge");
 
         let mut with_server = pool_ip("10.0.0.41", "vmbr1");
@@ -1529,11 +1543,11 @@ mod tests {
                     server_ip: None,
                     lease_time_secs: Some(600),
                 },
-                // Invalid (outside the gateway's subnet): skipped at startup.
+                // Invalid (start and end in different /24s): skipped at startup.
                 DhcpRange {
                     interface: String::new(),
                     start: "192.168.5.10".into(),
-                    end: "192.168.5.20".into(),
+                    end: "192.168.6.20".into(),
                     gateway: "10.0.0.1".into(),
                     cidr: 24,
                     dns_servers: vec![],
@@ -1744,9 +1758,36 @@ mod tests {
     }
 
     #[test]
-    fn effective_cidr_rejects_far_mismatch() {
-        let ip = Ipv4Addr::new(193, 34, 78, 50);
-        let gw = Ipv4Addr::new(193, 34, 77, 1);
-        assert!(effective_cidr_for_gateway_and_ip(ip, gw, 24).is_err());
+    fn effective_cidr_keeps_mask_for_routed_gateway() {
+        // Routed /28 with the provider gateway in another /23.
+        let ip = Ipv4Addr::new(212, 87, 213, 113);
+        let gw = Ipv4Addr::new(212, 87, 212, 1);
+        assert_eq!(effective_cidr_for_gateway_and_ip(ip, gw, 28).unwrap(), 28);
+        assert!(gateway_needs_onlink_route(ip, gw, 28));
+        assert!(!gateway_needs_onlink_route(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 0, 1), 24));
+    }
+
+    #[test]
+    fn dhcp_response_adds_onlink_route_for_routed_gateway() {
+        let request = parse_dhcp_request(&base_packet_with_options(&[53, 1, 1, 255])).unwrap();
+        let lease = DhcpLease {
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            ip: "212.87.213.113".into(),
+            hostname: None,
+            vmid: None,
+            node: None,
+            gateway: "212.87.212.1".into(),
+            cidr: 28,
+            dns_servers: vec![],
+            lease_start: 0,
+            lease_end: 0,
+            state: "active".into(),
+            static_lease: true,
+        };
+        let out = build_dhcp_response(&request, &lease, DHCP_OFFER, Ipv4Addr::new(212, 87, 212, 1), 3600).unwrap();
+        let expected = [121u8, 14, 32, 212, 87, 212, 1, 0, 0, 0, 0, 0, 212, 87, 212, 1];
+        assert!(out.windows(expected.len()).any(|w| w == expected));
+        // Mask stays /28.
+        assert!(out.windows(6).any(|w| w == [1, 4, 255, 255, 255, 240]));
     }
 }

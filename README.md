@@ -122,7 +122,8 @@ Then run `sudo systemctl restart feathertail`.
 - The gateway, the server IP and the network/broadcast addresses are skipped.
 - An offered IP is held for 60 s. After the client's REQUEST, the lease runs for the full lease time. When a lease expires or the client releases it, the IP is free again.
 - Dynamic leases appear in the UI and in `GET /dhcp/leases` with `static_lease: false`.
-- Invalid ranges (for example, a range outside the gateway's subnet) are logged and skipped at startup.
+- Invalid ranges (for example, start and end in different subnets) are logged and skipped at startup.
+- The gateway may be outside the client subnet, for example a routed `/28` like `212.87.213.113/28` via `212.87.212.1`. This works for static leases, the IP pool and ranges. The client keeps its real mask, and the reply also carries DHCP option 121/249 (classless static routes): `gateway/32` on-link plus the default route via the gateway.
 - The `firewall_*` settings also apply to dynamic clients. With `allowlist`, only the listed MACs get an IP.
 
 ## API
