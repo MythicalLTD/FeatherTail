@@ -611,6 +611,20 @@ pub async fn delete_lease(
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
+pub async fn renew_lease(
+    State(state): State<AppState>,
+    Path(mac): Path<String>,
+) -> ApiResult<DhcpLease> {
+    let lease = state
+        .store
+        .reactivate_lease_by_mac(&mac)
+        .await
+        .map_err(|e| err(StatusCode::CONFLICT, e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no lease for {mac}")))?;
+    info!(mac = %lease.mac, ip = %lease.ip, "admin ui renewed lease");
+    Ok(Json(lease))
+}
+
 // ---------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------

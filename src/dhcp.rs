@@ -532,6 +532,35 @@ impl DhcpService {
         self.find_lease_by_mac(&normalized).await
     }
 
+    /// Admin action: brings a lease back to `active` (whatever its current state, e.g. after a
+    /// client DHCPRELEASE or expiry) and restarts its lease timer, keeping IP/gateway/etc.
+    pub async fn reactivate_lease_by_mac(&self, mac: &str) -> Result<Option<DhcpLease>, DynError> {
+        let normalized = normalize_mac(mac)?;
+        let Some(existing) = self.find_lease_by_mac(&normalized).await? else {
+            return Ok(None);
+        };
+        if let Some(holder) = self.lease_holding_ip(&existing.ip, &normalized).await? {
+            if holder.static_lease || (holder.state == "active" && holder.lease_end > now_unix()) {
+                return Err(format!("{} is now held by {}", existing.ip, holder.mac).into());
+            }
+        }
+
+        let now = now_unix();
+        let lease_end = now + i64::try_from(self.config.lease_time_secs).unwrap_or(86_400);
+        sqlx::query(
+            "UPDATE dhcp_leases SET lease_start = ?, lease_end = ?, state = 'active', updated_at = ? WHERE mac = ?",
+        )
+        .bind(now)
+        .bind(lease_end)
+        .bind(now)
+        .bind(&normalized)
+        .execute(&self.pool)
+        .await?;
+
+        info!(mac = %normalized, ip = %existing.ip, lease_end, "dhcp lease reactivated");
+        self.find_lease_by_mac(&normalized).await
+    }
+
     pub async fn remove_lease_by_mac(&self, mac: &str) -> Result<bool, DynError> {
         let normalized = normalize_mac(mac)?;
         let result = sqlx::query("DELETE FROM dhcp_leases WHERE mac = ?")

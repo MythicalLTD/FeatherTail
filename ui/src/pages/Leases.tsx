@@ -53,6 +53,22 @@ export default function Leases({ params }: PageProps) {
     refreshAll()
   }
 
+  const renewMany = async (list: LeaseView[]) => {
+    let failed = 0
+    for (const l of list) {
+      try {
+        await api.post(`/admin/leases/${enc(l.mac)}/renew`, {})
+      } catch (e) {
+        failed++
+        toast(<>{l.ip}: {errorMessage(e)}</>, 'danger')
+      }
+    }
+    const ok = list.length - failed
+    if (ok > 0) toast(list.length === 1 ? <>Renewed <span className="font-monospace">{list[0].ip}</span></> : `Renewed ${ok} leases`)
+    setSelected(new Set())
+    refreshAll()
+  }
+
   const exportCsv = () =>
     downloadCsv('feathertail-leases.csv', [
       ['ip', 'mac', 'vmid', 'guest', 'hostname', 'bridge', 'gateway', 'cidr', 'dns', 'state', 'lease_end'],
@@ -209,6 +225,13 @@ export default function Leases({ params }: PageProps) {
                             <i className="bi bi-arrow-left-right" />
                           </button>
                         )}
+                        <button
+                          className={`btn btn-sm ${l.state === 'active' ? 'btn-outline-secondary' : 'btn-outline-success'}`}
+                          title={l.state === 'active' ? 'Renew lease' : 'Reactivate lease'}
+                          onClick={() => renewMany([l])}
+                        >
+                          <i className="bi bi-arrow-clockwise" />
+                        </button>
                         <button className="btn btn-sm btn-outline-danger" title="Release" onClick={() => removeMany([l])}>
                           <i className="bi bi-trash3" />
                         </button>
@@ -229,6 +252,9 @@ export default function Leases({ params }: PageProps) {
           <span className="fw-semibold">{selected.size} selected</span>
           <button className="btn btn-sm btn-outline-secondary" onClick={() => setSelected(new Set())}>
             Clear
+          </button>
+          <button className="btn btn-sm btn-success" onClick={() => renewMany((data || []).filter((l) => selected.has(l.mac)))}>
+            <i className="bi bi-arrow-clockwise" /> Renew
           </button>
           <button className="btn btn-sm btn-danger" onClick={() => removeMany((data || []).filter((l) => selected.has(l.mac)))}>
             <i className="bi bi-trash3" /> Release
