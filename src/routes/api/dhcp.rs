@@ -163,6 +163,7 @@ pub async fn assign_lease(
             cidr: payload.cidr,
             dns_servers: payload.dns_servers,
             lease_time_secs: payload.lease_time_secs,
+            replace_vmid_leases: true,
         })
         .await
         .map_err(bad_request_or_internal)?;

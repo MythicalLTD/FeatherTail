@@ -8,3 +8,10 @@ wings
 feathertail
 packaging/changelog.yaml
 packaging/feathertail.metainfo.xml
+
+# admin web UI
+ui/node_modules/
+ui/dist/
+
+# local dev state
+dev/data/

@@ -14,6 +14,9 @@ bind = "0.0.0.0:8686"
 [auth]
 # Overwritten by the FeatherPanel installer when FP_TAIL_TOKEN is set.
 api_token = "change-me"
+# Admin web UI (http://<node>:8686/ui/) password, set with `feathertail set-password`.
+# The api_token above is accepted as a UI login too.
+# admin_password_hash = ""
 
 [dhcp]
 # Keep disabled until you intentionally run DHCP on this node/bridge.

@@ -1,0 +1,16 @@
+# Local dev config: `make dev` (or see README "Local development").
+[daemon]
+name = "feathertail-dev"
+poll_interval_secs = 60
+log_level = "info"
+
+[api]
+bind = "127.0.0.1:8686"
+
+[auth]
+api_token = "dev-token"
+
+[dhcp]
+# Leave off on a workstation: it would answer real DHCP on your LAN.
+enabled = false
+database_path = "dev/data/dhcp.sqlite3"

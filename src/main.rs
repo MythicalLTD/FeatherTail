@@ -2,6 +2,8 @@ mod auth;
 mod config;
 mod daemon;
 mod dhcp;
+mod dhcp_socket;
+mod inventory;
 mod openapi;
 mod proxmox;
 mod routes;
@@ -50,6 +52,48 @@ fn validate_config(cfg: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// `feathertail set-password [--config path]`: reads the new password from
+/// FEATHERTAIL_ADMIN_PASSWORD or from stdin (first line), stores a bcrypt hash in the config.
+fn run_set_password(config_path: &str) -> Result<(), String> {
+    let password = match env::var("FEATHERTAIL_ADMIN_PASSWORD") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprint!("New admin UI password: ");
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    if !Path::new(config_path).exists() {
+        AppConfig::load_or_bootstrap(Path::new(config_path)).map_err(|e| e.to_string())?;
+    }
+    let hash = auth::hash_password(&password)?;
+    auth::write_password_hash(config_path, &hash)
+}
+
+/// Production start-up checks: systemd unit refresh, Proxmox host check, noVNC assets.
+fn start_checks(config_path: &str) {
+    if let Err(err) = service_install::refresh_managed_service_on_start(config_path) {
+        error!(error = %err, "failed to refresh managed systemd unit");
+    }
+
+    if !vnc_assets::is_proxmox_host() {
+        error!("FeatherTail agent only runs on proxmox hosts");
+        eprintln!("FeatherTail agent only runs on proxmox hosts");
+        std::process::exit(1);
+    }
+
+    if let Err(err) = vnc_assets::install_bundled_vnc_assets() {
+        error!(error = %err, "failed to install bundled noVNC assets");
+        eprintln!("failed to install bundled noVNC assets: {err}");
+        std::process::exit(1);
+    }
+
+    info!(target = "/usr/share/novnc-pve", "bundled noVNC assets installed");
+}
+
 #[tokio::main]
 async fn main() {
     let local_default = "feathertail.toml";
@@ -60,13 +104,17 @@ async fn main() {
         system_default.to_owned()
     };
     let mut run_once = false;
+    let mut dev_mode = false;
     let mut service_install_mode = false;
+    let mut set_password_mode = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "service-install" => service_install_mode = true,
+            "set-password" => set_password_mode = true,
             "--once" => run_once = true,
+            "--dev" => dev_mode = true,
             "--config" => {
                 if let Some(path) = args.next() {
                     config_path = path;
@@ -77,6 +125,19 @@ async fn main() {
             }
             value => {
                 config_path = value.to_owned();
+            }
+        }
+    }
+
+    if set_password_mode {
+        match run_set_password(&config_path) {
+            Ok(()) => {
+                println!("Admin UI password saved to {config_path}. Restart: systemctl restart feathertail");
+                return;
+            }
+            Err(err) => {
+                eprintln!("set-password failed: {err}");
+                std::process::exit(1);
             }
         }
     }
@@ -120,23 +181,14 @@ async fn main() {
         );
     }
 
-    if let Err(err) = service_install::refresh_managed_service_on_start(&config_path) {
-        error!(error = %err, "failed to refresh managed systemd unit");
+    if dev_mode {
+        // Local development (e.g. Windows/macOS): no Proxmox checks, no systemd, no noVNC.
+        // Guests are read from FEATHERTAIL_PVE_NODES_DIR (see dev/pve) instead of /etc/pve.
+        warn!("DEV MODE: skipping proxmox host checks, systemd refresh and noVNC install");
+        eprintln!("FeatherTail DEV MODE: not for production use");
+    } else {
+        start_checks(&config_path);
     }
-
-    if !vnc_assets::is_proxmox_host() {
-        error!("FeatherTail agent only runs on proxmox hosts");
-        eprintln!("FeatherTail agent only runs on proxmox hosts");
-        std::process::exit(1);
-    }
-
-    if let Err(err) = vnc_assets::install_bundled_vnc_assets() {
-        error!(error = %err, "failed to install bundled noVNC assets");
-        eprintln!("failed to install bundled noVNC assets: {err}");
-        std::process::exit(1);
-    }
-
-    info!(target = "/usr/share/novnc-pve", "bundled noVNC assets installed");
 
     info!(
         name = %config.daemon.name,

@@ -7,18 +7,28 @@ use axum::response::Html;
 use axum::{Json, Router, routing::get};
 use utoipa::OpenApi;
 
+use crate::auth::AdminAuth;
+use crate::config::DhcpConfig;
 use crate::dhcp::DhcpService;
 use crate::proxmox::ProxmoxClient;
+
+pub mod ui;
 
 #[derive(Clone)]
 pub struct AppState {
     pub daemon_name: String,
-    pub auth_token: String,
     pub config_path: String,
     pub api_bind: String,
     pub dhcp_enabled: bool,
     pub proxmox: Arc<ProxmoxClient>,
+    /// Only set while the DHCP listener is enabled (FeatherPanel API semantics).
     pub dhcp: Option<Arc<DhcpService>>,
+    /// Always available lease/pool store, used by the admin UI even when the listener is off.
+    pub store: Arc<DhcpService>,
+    pub auth: Arc<AdminAuth>,
+    pub pvesh_bin: String,
+    pub dhcp_config: DhcpConfig,
+    pub token_is_default: bool,
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -30,6 +40,10 @@ pub fn build_app(state: AppState) -> Router {
             get(|| async { Json(crate::openapi::ApiDoc::openapi()) }),
         )
         .nest("/api/v1", api::router(state.clone()))
+        .route("/", get(ui::redirect_to_ui))
+        .route("/ui", get(ui::redirect_to_ui))
+        .route("/ui/", get(ui::index))
+        .route("/ui/{*path}", get(ui::asset))
         .fallback(not_found_json)
         .with_state(state)
 }

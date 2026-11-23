@@ -109,6 +109,40 @@ curl -X POST http://127.0.0.1:8686/api/v1/dhcp/leases \
   }'
 ```
 
+## Admin web UI
+
+FeatherTail ships a small admin UI inside the binary. You can manage DHCP without FeatherPanel:
+
+```
+http://<node-ip>:8686/ui/
+```
+
+Log in with the daemon `api_token`, or set a separate admin password:
+
+```bash
+sudo feathertail set-password --config /etc/feathertail/feathertail.toml
+# or non-interactive:
+sudo FEATHERTAIL_ADMIN_PASSWORD='...' feathertail set-password --config /etc/feathertail/feathertail.toml
+sudo systemctl restart feathertail
+```
+
+The UI has these pages:
+
+- **Status**: listener state, lease and pool counts, every bridge with its pool usage.
+- **Assign IP**: pick a VM/CT (ID + name), then one of its bridges (the MAC comes from the Proxmox config), then a free IP on that bridge.
+- **DHCP Leases**: search, change IP, delete, or add a manual lease for any MAC.
+- **IP Pool**: you decide which IPs are handed out on which bridge (`vmbr0` public IPs, `vmbr1` 10.0.0.x, ...). Add single IPs, lists or ranges (`10.0.0.40-10.0.0.100`, `1.2.3.4-8`), each with its gateway, CIDR and DNS.
+- **VMs & CTs**: every NIC with its MAC, bridge and lease.
+- **Settings**: turn the DHCP listener on or off, set the default server IP and lease time, restart the service, change the password, view logs.
+
+FeatherTail **never changes host networking**: no bridges, no addresses, no NAT or iptables. You set up the bridges yourself (e.g. `vmbr1` with `10.0.0.1/24` on the host). FeatherTail answers DHCP and sends each reply out of the interface the request came in on. An IP from the pool is only handed out on the bridge you put it on. The DHCP server identifier is the pool entry's *server IP*, or its gateway when that field is empty.
+
+Sessions are a `HttpOnly; SameSite=Strict` cookie and expire after 12 hours. The UI is plain HTTP on the API port, so firewall `8686` to trusted IPs or put it behind a TLS reverse proxy.
+
+Building from source needs Node.js/npm; `build.rs` runs `npm ci && npm run build` in `ui/`. Set `FEATHERTAIL_SKIP_UI_BUILD=1` to skip that step and embed a placeholder page. For UI development, run `cd ui && FT_API=http://<node>:8686 npm run dev`.
+
+The admin API is under `/api/v1/admin/*` and `/api/v1/auth/*`. It accepts the session cookie or `Authorization: Bearer <api_token>`.
+
 ## Notes
 
 - Requires Proxmox VE (`pve-manager`). Non-Proxmox hosts cannot satisfy the dependency.

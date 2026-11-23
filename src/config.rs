@@ -106,12 +106,17 @@ impl Default for ApiConfig {
 pub struct AuthConfig {
     #[serde(default = "default_api_token")]
     pub api_token: String,
+    /// bcrypt hash of the admin web UI password (`feathertail set-password`).
+    /// The web UI also accepts `api_token` as a password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password_hash: Option<String>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             api_token: default_api_token(),
+            admin_password_hash: None,
         }
     }
 }

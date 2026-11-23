@@ -156,7 +156,18 @@ impl Daemon {
 
         let app = routes::build_app(routes::AppState {
             daemon_name: self.config.daemon.name.clone(),
-            auth_token: self.config.auth.api_token.clone(),
+            store: Arc::clone(&self.dhcp),
+            auth: Arc::new(crate::auth::AdminAuth::new(
+                self.config.auth.api_token.clone(),
+                self.config.auth.admin_password_hash.clone(),
+                self.config_path.clone(),
+            )),
+            pvesh_bin: self.config.proxmox.pvesh_bin.clone(),
+            dhcp_config: self.config.dhcp.clone(),
+            token_is_default: {
+                let t = self.config.auth.api_token.trim();
+                t.is_empty() || t == "change-me"
+            },
             config_path: self.config_path.clone(),
             api_bind: self.config.api.bind.clone(),
             dhcp_enabled: self.dhcp.enabled(),

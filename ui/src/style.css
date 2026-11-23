@@ -1,0 +1,80 @@
+/* Layout only. Everything visual comes from stock Bootstrap. */
+
+.ft-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.ft-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.ft-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.ft-main {
+  max-width: 1440px;
+}
+
+.ft-logo {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+}
+[data-bs-theme='light'] .ft-logo {
+  filter: invert(1);
+}
+
+.ip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.5rem;
+}
+.ip-grid .btn {
+  text-align: left;
+  min-width: 0;
+}
+.ip-grid .sub {
+  font-size: 0.75rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.8;
+}
+
+.min-w-0 {
+  min-width: 0;
+}
+.cursor-pointer {
+  cursor: pointer;
+}
+.copyable {
+  cursor: copy;
+}
+
+.toast-container {
+  z-index: 2000;
+}
+
+@media (max-width: 900px) {
+  .ft-shell {
+    flex-direction: column;
+  }
+  .ft-sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+  }
+}
+
+/* icon + text spacing inside buttons */
+.btn > .bi:not(:only-child),
+.btn > .spinner-border:not(:only-child) {
+  margin-right: 0.35rem;
+}

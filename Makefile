@@ -27,3 +27,8 @@ deb:
 
 deb-dev:
 	PACKAGE_CHANNEL=dev ./scripts/build-deb.sh
+
+# Run the admin UI locally (Windows/macOS/Linux) with fake guests from dev/pve.
+# Open http://127.0.0.1:8686/ui/ and log in with "dev-token".
+dev:
+	FEATHERTAIL_PVE_NODES_DIR=dev/pve cargo run -- --dev --config dev/feathertail.dev.toml

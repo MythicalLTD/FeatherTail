@@ -7,13 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
-use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::config::DhcpConfig;
+use crate::dhcp_socket::{DhcpSocket, interface_name};
 
 type DynError = Box<dyn Error + Send + Sync>;
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
@@ -51,6 +51,136 @@ pub struct AssignLeaseInput {
     pub cidr: u8,
     pub dns_servers: Vec<String>,
     pub lease_time_secs: Option<u64>,
+    /// FeatherPanel semantics: one lease per VM, so older leases of the same vmid are dropped.
+    /// The admin UI sets this to false so multi-NIC VMs keep one lease per MAC.
+    pub replace_vmid_leases: bool,
+}
+
+/// One IP the admin put on a bridge. Purely user input: FeatherTail never touches host
+/// networking, it only answers DHCP on that bridge with these values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PoolIp {
+    pub ip: String,
+    pub bridge: String,
+    pub gateway: String,
+    pub cidr: u8,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    /// DHCP server identifier sent to clients. Defaults to the gateway when empty.
+    #[serde(default)]
+    pub server_ip: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+impl PoolIp {
+    fn server_identifier(&self) -> Option<Ipv4Addr> {
+        self.server_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.gateway.parse().ok())
+    }
+
+    /// Validates and normalizes user input.
+    pub fn validate(&mut self) -> Result<(), DynError> {
+        self.bridge = self.bridge.trim().to_owned();
+        validate_bridge_name(&self.bridge)?;
+        let ip = parse_ipv4(self.ip.trim())
+            .map_err(|_| format!("invalid ip '{}'", self.ip.trim()))?;
+        let gateway = parse_ipv4(self.gateway.trim())
+            .map_err(|_| format!("invalid gateway '{}'", self.gateway.trim()))?;
+        if ip == gateway {
+            return Err(format!("invalid ip {ip}: it is the gateway itself").into());
+        }
+        let cidr = effective_cidr_for_gateway_and_ip(ip, gateway, self.cidr)?;
+        if cidr != self.cidr {
+            return Err(format!(
+                "invalid ip {ip}: not in the same /{} as gateway {gateway} (try /{cidr})",
+                self.cidr
+            )
+            .into());
+        }
+        self.ip = ip.to_string();
+        self.gateway = gateway.to_string();
+        self.server_ip = match self.server_ip.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(
+                parse_ipv4(raw)
+                    .map_err(|_| format!("invalid server ip '{raw}'"))?
+                    .to_string(),
+            ),
+        };
+        self.dns_servers = normalize_dns_list(&self.dns_servers)?;
+        self.notes = self
+            .notes
+            .take()
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty());
+        Ok(())
+    }
+}
+
+pub fn validate_bridge_name(bridge: &str) -> Result<(), DynError> {
+    if bridge.is_empty()
+        || bridge.len() > 15
+        || !bridge
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("invalid bridge '{bridge}': use an interface name like vmbr1").into());
+    }
+    Ok(())
+}
+
+fn normalize_dns_list(values: &[String]) -> Result<Vec<String>, DynError> {
+    values
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            parse_ipv4(d)
+                .map(|v| v.to_string())
+                .map_err(|_| -> DynError { format!("invalid dns server '{d}'").into() })
+        })
+        .collect()
+}
+
+/// Expands "a.b.c.d-a.b.c.e" / "a.b.c.d - e" / single IPs / comma or newline lists.
+pub fn expand_ip_list(input: &str) -> Result<Vec<String>, DynError> {
+    let mut out = Vec::new();
+    for token in input.split([',', ';', '\n']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = token.split_once('-') {
+            let start = parse_ipv4(a.trim()).map_err(|_| format!("invalid ip '{}'", a.trim()))?;
+            let b = b.trim();
+            let end = if b.contains('.') {
+                parse_ipv4(b).map_err(|_| format!("invalid ip '{b}'"))?
+            } else {
+                let last: u8 = b.parse().map_err(|_| format!("invalid range end '{b}'"))?;
+                let o = start.octets();
+                Ipv4Addr::new(o[0], o[1], o[2], last)
+            };
+            let (s, e) = (ipv4_to_u32(start), ipv4_to_u32(end));
+            if s > e {
+                return Err(format!("invalid range {token}: start is after end").into());
+            }
+            if e - s >= 1024 {
+                return Err(format!("range {token} is too large (max 1024 IPs at once)").into());
+            }
+            for u in s..=e {
+                out.push(Ipv4Addr::from(u).to_string());
+            }
+        } else {
+            out.push(parse_ipv4(token).map_err(|_| format!("invalid ip '{token}'"))?.to_string());
+        }
+    }
+    out.dedup();
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -166,7 +296,7 @@ impl DhcpService {
         let lease_time_secs = input.lease_time_secs.unwrap_or(self.config.lease_time_secs);
         let lease_end = now + i64::try_from(lease_time_secs).unwrap_or(86_400);
 
-        if let Some(vmid) = input.vmid {
+        if let (true, Some(vmid)) = (input.replace_vmid_leases, input.vmid) {
             sqlx::query("DELETE FROM dhcp_leases WHERE vmid = ?")
                 .bind(i64::from(vmid))
                 .execute(&self.pool)
@@ -297,18 +427,119 @@ impl DhcpService {
         self.find_lease_by_mac(&normalized).await
     }
 
+    pub async fn remove_lease_by_mac(&self, mac: &str) -> Result<bool, DynError> {
+        let normalized = normalize_mac(mac)?;
+        let result = sqlx::query("DELETE FROM dhcp_leases WHERE mac = ?")
+            .bind(&normalized)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() > 0 {
+            info!(mac = %normalized, "dhcp lease deleted from database");
+        }
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Returns the lease (other than `except_mac`) that already holds `ip`, if any.
+    pub async fn lease_holding_ip(&self, ip: &str, except_mac: &str) -> Result<Option<DhcpLease>, DynError> {
+        let except = normalize_mac(except_mac)?;
+        let row = sqlx::query(
+            "SELECT mac, ip, hostname, vmid, node, gateway, cidr, dns_servers, lease_start, lease_end, state, static_flag FROM dhcp_leases WHERE ip = ? AND mac != ? LIMIT 1",
+        )
+        .bind(ip)
+        .bind(&except)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| decode_lease_row(&r)).transpose()
+    }
+
+    // ---- IP pool (admin UI) -------------------------------------------------------------
+
+    pub async fn list_pool(&self) -> Result<Vec<PoolIp>, DynError> {
+        let rows = sqlx::query(
+            "SELECT ip, bridge, gateway, cidr, dns_servers, server_ip, notes FROM dhcp_pool",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(decode_pool_row(&row)?);
+        }
+        out.sort_by(|a, b| {
+            a.bridge.cmp(&b.bridge).then_with(|| {
+                let ua = a.ip.parse::<Ipv4Addr>().map(ipv4_to_u32).unwrap_or(0);
+                let ub = b.ip.parse::<Ipv4Addr>().map(ipv4_to_u32).unwrap_or(0);
+                ua.cmp(&ub)
+            })
+        });
+        Ok(out)
+    }
+
+    pub async fn find_pool_ip(&self, ip: &str) -> Result<Option<PoolIp>, DynError> {
+        let row = sqlx::query(
+            "SELECT ip, bridge, gateway, cidr, dns_servers, server_ip, notes FROM dhcp_pool WHERE ip = ?",
+        )
+        .bind(ip)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| decode_pool_row(&r)).transpose()
+    }
+
+    /// Inserts or updates pool entries. All entries are validated before anything is written.
+    pub async fn upsert_pool(&self, mut entries: Vec<PoolIp>) -> Result<Vec<PoolIp>, DynError> {
+        for entry in entries.iter_mut() {
+            entry.validate()?;
+        }
+        let mut tx = self.pool.begin().await?;
+        for entry in &entries {
+            sqlx::query(
+                "INSERT INTO dhcp_pool (ip, bridge, gateway, cidr, dns_servers, server_ip, notes, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(ip) DO UPDATE SET bridge = excluded.bridge, gateway = excluded.gateway, \
+                 cidr = excluded.cidr, dns_servers = excluded.dns_servers, server_ip = excluded.server_ip, \
+                 notes = excluded.notes, updated_at = excluded.updated_at",
+            )
+            .bind(&entry.ip)
+            .bind(&entry.bridge)
+            .bind(&entry.gateway)
+            .bind(i64::from(entry.cidr))
+            .bind(serde_json::to_string(&entry.dns_servers)?)
+            .bind(entry.server_ip.clone())
+            .bind(entry.notes.clone())
+            .bind(now_unix())
+            .execute(&mut *tx)
+            .await?;
+            // Keep existing leases on this IP in sync with the edited network settings.
+            sqlx::query("UPDATE dhcp_leases SET gateway = ?, cidr = ?, dns_servers = ?, updated_at = ? WHERE ip = ?")
+                .bind(&entry.gateway)
+                .bind(i64::from(entry.cidr))
+                .bind(serde_json::to_string(&entry.dns_servers)?)
+                .bind(now_unix())
+                .bind(&entry.ip)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        info!(count = entries.len(), "dhcp pool entries saved");
+        Ok(entries)
+    }
+
+    pub async fn delete_pool_ip(&self, ip: &str) -> Result<bool, DynError> {
+        let result = sqlx::query("DELETE FROM dhcp_pool WHERE ip = ?")
+            .bind(ip)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn run_listener(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), DynError> {
         if !self.config.enabled {
             info!("dhcp listener disabled by config");
             return Ok(());
         }
 
-        let socket = UdpSocket::bind(&self.config.bind).await?;
-        socket.set_broadcast(true)?;
-        info!(
-            bind = %self.config.bind,
-            "dhcp listener started"
-        );
+        let bind: SocketAddr = self.config.bind.parse()?;
+        let socket = DhcpSocket::bind(bind)?;
+        info!(bind = %self.config.bind, "dhcp listener started");
 
         let mut buffer = [0u8; 1500];
         loop {
@@ -319,12 +550,16 @@ impl DhcpService {
                         break;
                     }
                 }
-                recv = socket.recv_from(&mut buffer) => {
+                recv = socket.recv(&mut buffer) => {
                     match recv {
-                        Ok((size, src)) => {
-                            debug!(size, src = %src, "dhcp packet received");
-                            if let Err(err) = self.handle_dhcp_packet(&socket, &buffer[..size], src).await {
-                                warn!(error = %err, src = %src, "failed to process dhcp packet");
+                        Ok(got) => {
+                            let ifname = got.ifindex.and_then(interface_name);
+                            debug!(size = got.len, src = %got.src, iface = ?ifname, "dhcp packet received");
+                            if let Err(err) = self
+                                .handle_dhcp_packet(&socket, &buffer[..got.len], got.src, got.ifindex, ifname.as_deref())
+                                .await
+                            {
+                                warn!(error = %err, src = %got.src, iface = ?ifname, "failed to process dhcp packet");
                             }
                         }
                         Err(err) => {
@@ -340,9 +575,11 @@ impl DhcpService {
 
     async fn handle_dhcp_packet(
         &self,
-        socket: &UdpSocket,
+        socket: &DhcpSocket,
         packet: &[u8],
         src: SocketAddr,
+        ifindex: Option<u32>,
+        ifname: Option<&str>,
     ) -> Result<(), DynError> {
         let Some(request) = parse_dhcp_request(packet) else {
             return Ok(());
@@ -355,12 +592,35 @@ impl DhcpService {
 
         let lease = self.find_lease_by_mac(&request.mac).await?;
         let lease_vmid = lease.as_ref().and_then(|l| l.vmid);
+        let pool_entry = match lease.as_ref() {
+            Some(l) => self.find_pool_ip(&l.ip).await?,
+            None => None,
+        };
+
+        // An IP the admin put on a bridge is only handed out on that bridge.
+        if let (Some(entry), Some(iface)) = (pool_entry.as_ref(), ifname) {
+            if entry.bridge != iface {
+                debug!(
+                    mac = %request.mac,
+                    ip = %entry.ip,
+                    pool_bridge = %entry.bridge,
+                    iface,
+                    "ignoring dhcp packet: lease ip belongs to another bridge"
+                );
+                return Ok(());
+            }
+        }
+
+        let server_ip = match pool_entry.as_ref().and_then(PoolIp::server_identifier) {
+            Some(ip) => ip,
+            None => parse_ipv4(&self.config.server_ip)?,
+        };
 
         if !self.host_allowed(&request.mac, lease_vmid) {
             let target = resolve_dhcp_target(&request, src);
             if request.msg_type == DHCP_REQUEST {
-                let response = build_dhcp_nak_response(&request, parse_ipv4(&self.config.server_ip)?);
-                socket.send_to(&response, target).await?;
+                let response = build_dhcp_nak_response(&request, server_ip);
+                socket.send(&response, target, ifindex).await?;
                 info!(mac = %request.mac, vmid = ?lease_vmid, mode = %self.config.firewall_mode, "dhcp request blocked by firewall (nak sent)");
             } else {
                 info!(mac = %request.mac, vmid = ?lease_vmid, mode = %self.config.firewall_mode, "dhcp packet blocked by firewall");
@@ -380,17 +640,17 @@ impl DhcpService {
         if request.msg_type == DHCP_REQUEST {
             match lease.as_ref() {
                 None => {
-                    let response = build_dhcp_nak_response(&request, parse_ipv4(&self.config.server_ip)?);
+                    let response = build_dhcp_nak_response(&request, server_ip);
                     let target = resolve_dhcp_target(&request, src);
-                    socket.send_to(&response, target).await?;
+                    socket.send(&response, target, ifindex).await?;
                     info!(mac = %request.mac, target = %target, "dhcp nak sent for unknown lease");
                     return Ok(());
                 }
                 Some(found) => {
                     if found.state != "active" {
-                        let response = build_dhcp_nak_response(&request, parse_ipv4(&self.config.server_ip)?);
+                        let response = build_dhcp_nak_response(&request, server_ip);
                         let target = resolve_dhcp_target(&request, src);
-                        socket.send_to(&response, target).await?;
+                        socket.send(&response, target, ifindex).await?;
                         info!(mac = %request.mac, state = %found.state, target = %target, "dhcp nak sent for non-active lease");
                         return Ok(());
                     }
@@ -401,9 +661,9 @@ impl DhcpService {
                         .or_else(|| (request.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(request.ciaddr));
                     if let Some(req_ip) = requested {
                         if req_ip != expected {
-                            let response = build_dhcp_nak_response(&request, parse_ipv4(&self.config.server_ip)?);
+                            let response = build_dhcp_nak_response(&request, server_ip);
                             let target = resolve_dhcp_target(&request, src);
-                            socket.send_to(&response, target).await?;
+                            socket.send(&response, target, ifindex).await?;
                             info!(
                                 mac = %request.mac,
                                 requested_ip = %req_ip,
@@ -441,11 +701,11 @@ impl DhcpService {
             &request,
             &lease,
             response_type,
-            parse_ipv4(&self.config.server_ip)?,
+            server_ip,
             self.config.lease_time_secs,
         )?;
         let target = resolve_dhcp_target(&request, src);
-        socket.send_to(&response, target).await?;
+        socket.send(&response, target, ifindex).await?;
 
         info!(
             mac = %lease.mac,
@@ -520,6 +780,11 @@ impl DhcpService {
             .execute(&self.pool)
             .await;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dhcp_pool (                ip TEXT PRIMARY KEY,                bridge TEXT NOT NULL,                gateway TEXT NOT NULL,                cidr INTEGER NOT NULL,                dns_servers TEXT NOT NULL DEFAULT '[]',                server_ip TEXT,                notes TEXT,                updated_at INTEGER NOT NULL            )",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_dhcp_leases_vmid ON dhcp_leases(vmid)")
             .execute(&self.pool)
             .await?;
@@ -801,6 +1066,20 @@ fn now_unix() -> i64 {
     }
 }
 
+fn decode_pool_row(row: &sqlx::sqlite::SqliteRow) -> Result<PoolIp, DynError> {
+    let cidr_i64: i64 = row.try_get("cidr")?;
+    let dns_raw: String = row.try_get("dns_servers")?;
+    Ok(PoolIp {
+        ip: row.try_get("ip")?,
+        bridge: row.try_get("bridge")?,
+        gateway: row.try_get("gateway")?,
+        cidr: u8::try_from(cidr_i64).map_err(|_| "invalid cidr in pool row")?,
+        dns_servers: serde_json::from_str(&dns_raw).unwrap_or_default(),
+        server_ip: row.try_get("server_ip")?,
+        notes: row.try_get("notes")?,
+    })
+}
+
 pub fn normalize_mac(value: &str) -> Result<String, DynError> {
     let stripped: String = value
         .chars()
@@ -849,6 +1128,109 @@ fn decode_lease_row(row: &sqlx::sqlite::SqliteRow) -> Result<DhcpLease, DynError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pool_ip(ip: &str, bridge: &str) -> PoolIp {
+        PoolIp {
+            ip: ip.into(),
+            bridge: bridge.into(),
+            gateway: "10.0.0.1".into(),
+            cidr: 24,
+            dns_servers: vec!["1.1.1.1".into()],
+            server_ip: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn expand_ip_list_handles_ranges_and_lists() {
+        let ips = expand_ip_list("10.0.0.40-42, 10.0.0.50\n10.0.0.60-10.0.0.61").unwrap();
+        assert_eq!(
+            ips,
+            vec!["10.0.0.40", "10.0.0.41", "10.0.0.42", "10.0.0.50", "10.0.0.60", "10.0.0.61"]
+        );
+        assert!(expand_ip_list("10.0.0.5-1").is_err());
+        assert!(expand_ip_list("10.0.0.0-10.0.255.255").is_err());
+        assert!(expand_ip_list("nope").is_err());
+    }
+
+    #[test]
+    fn pool_ip_validation() {
+        let mut ok = pool_ip("10.0.0.40", "vmbr1");
+        ok.validate().unwrap();
+        assert_eq!(ok.server_identifier(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+
+        assert!(pool_ip("10.0.0.1", "vmbr1").validate().is_err(), "gateway itself");
+        assert!(pool_ip("10.0.5.4", "vmbr1").validate().is_err(), "other subnet");
+        assert!(pool_ip("10.0.0.4", "vmbr1; rm -rf").validate().is_err(), "bad bridge");
+
+        let mut with_server = pool_ip("10.0.0.41", "vmbr1");
+        with_server.server_ip = Some(" 10.0.0.2 ".into());
+        with_server.validate().unwrap();
+        assert_eq!(with_server.server_identifier(), Some(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    async fn temp_service() -> (DhcpService, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "ft-dhcp-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let cfg = DhcpConfig {
+            database_path: path.to_string_lossy().to_string(),
+            ..DhcpConfig::default()
+        };
+        (DhcpService::new(cfg).await.unwrap(), path)
+    }
+
+    #[tokio::test]
+    async fn pool_and_multi_nic_leases() {
+        let (svc, path) = temp_service().await;
+        svc.upsert_pool(vec![pool_ip("10.0.0.40", "vmbr1"), pool_ip("10.0.0.41", "vmbr1")])
+            .await
+            .unwrap();
+        let entry = svc.find_pool_ip("10.0.0.40").await.unwrap().unwrap();
+        assert_eq!(entry.bridge, "vmbr1");
+        assert_eq!(entry.server_identifier(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+
+        let lease = |mac: &str, ip: &str, replace: bool| AssignLeaseInput {
+            mac: mac.into(),
+            ip: ip.into(),
+            hostname: None,
+            vmid: Some(100),
+            node: None,
+            gateway: "10.0.0.1".into(),
+            cidr: 24,
+            dns_servers: vec![],
+            lease_time_secs: None,
+            replace_vmid_leases: replace,
+        };
+
+        // Admin UI path: two NICs of the same VM keep separate leases.
+        svc.assign_static_lease(lease("aa:aa:aa:aa:aa:01", "10.0.0.40", false)).await.unwrap();
+        svc.assign_static_lease(lease("aa:aa:aa:aa:aa:02", "10.0.0.41", false)).await.unwrap();
+        assert_eq!(svc.list_leases().await.unwrap().len(), 2);
+
+        // Conflict detection sees the other MAC holding the IP.
+        let holder = svc.lease_holding_ip("10.0.0.40", "aa:aa:aa:aa:aa:02").await.unwrap();
+        assert_eq!(holder.unwrap().mac, "aa:aa:aa:aa:aa:01");
+        assert!(svc.lease_holding_ip("10.0.0.40", "aa:aa:aa:aa:aa:01").await.unwrap().is_none());
+
+        // Editing the pool entry syncs the lease's network settings.
+        let mut edited = pool_ip("10.0.0.40", "vmbr1");
+        edited.dns_servers = vec!["9.9.9.9".into()];
+        svc.upsert_pool(vec![edited]).await.unwrap();
+        let l = svc.find_lease_by_mac("aa:aa:aa:aa:aa:01").await.unwrap().unwrap();
+        assert_eq!(l.dns_servers, vec!["9.9.9.9"]);
+
+        // FeatherPanel path keeps its one-lease-per-VM behaviour.
+        svc.assign_static_lease(lease("aa:aa:aa:aa:aa:03", "10.0.0.42", true)).await.unwrap();
+        assert_eq!(svc.list_leases().await.unwrap().len(), 1);
+
+        assert!(svc.remove_lease_by_mac("AA-AA-AA-AA-AA-03").await.unwrap());
+        assert!(svc.delete_pool_ip("10.0.0.41").await.unwrap());
+        svc.pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
 
     fn base_packet_with_options(options: &[u8]) -> Vec<u8> {
         let mut packet = vec![0u8; 240];
