@@ -264,6 +264,13 @@ impl DynamicRange {
     }
 }
 
+/// Checks a `[[dhcp.ranges]]` entry the same way the daemon does at startup.
+pub fn validate_range(raw: &DhcpRange) -> Result<(), String> {
+    DynamicRange::from_config(raw, 86_400)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Clone)]
 pub struct DhcpService {
     config: DhcpConfig,

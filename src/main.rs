@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod configure;
 mod daemon;
 mod dhcp;
 mod dhcp_socket;
@@ -94,6 +95,19 @@ fn start_checks(config_path: &str) {
     info!(target = "/usr/share/novnc-pve", "bundled noVNC assets installed");
 }
 
+fn print_usage() {
+    println!("Usage: feathertail [command] [--config <path>] [--once] [--dev]");
+    println!();
+    println!("Commands:");
+    println!("  (none)           run the daemon");
+    println!("  configure        interactive setup (FeatherPanel and/or simple DHCP)");
+    println!("  set-password     set the admin web UI password");
+    println!("  service-install  install the binary as a systemd service");
+    println!("  help             show this help");
+    println!();
+    println!("Default config: /etc/feathertail/feathertail.toml");
+}
+
 #[tokio::main]
 async fn main() {
     let local_default = "feathertail.toml";
@@ -107,12 +121,18 @@ async fn main() {
     let mut dev_mode = false;
     let mut service_install_mode = false;
     let mut set_password_mode = false;
+    let mut configure_mode = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "service-install" => service_install_mode = true,
             "set-password" => set_password_mode = true,
+            "configure" | "setup" => configure_mode = true,
+            "help" | "--help" | "-h" => {
+                print_usage();
+                return;
+            }
             "--once" => run_once = true,
             "--dev" => dev_mode = true,
             "--config" => {
@@ -123,8 +143,26 @@ async fn main() {
                     std::process::exit(2);
                 }
             }
-            value => {
+            // A bare argument is a config path only if it looks like one; anything else is a
+            // mistyped command and must not create a stray config file.
+            value if value.ends_with(".toml") || value.contains('/') || Path::new(value).is_file() => {
                 config_path = value.to_owned();
+            }
+            other => {
+                eprintln!("unknown command '{other}'");
+                eprintln!();
+                print_usage();
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if configure_mode {
+        match configure::run(&config_path) {
+            Ok(()) => return,
+            Err(err) => {
+                eprintln!("configure failed: {err}");
+                std::process::exit(1);
             }
         }
     }

@@ -85,6 +85,14 @@ firewall_allow_vmids = []
 firewall_deny_vmids = []
 ```
 
+### Setup wizard
+
+```bash
+sudo feathertail configure
+```
+
+The wizard asks whether the node is used with FeatherPanel, as a simple DHCP server only, or both. Then it asks for the token, the listen address, the DHCP on/off switch and the range (bridge, gateway, CIDR, first/last IP, DNS). It detects the bridges (`vmbr*`) and their IP addresses, so the defaults usually just need Enter. In DHCP-only mode it generates a token for you and prints it; that token is also your web UI login. The wizard edits `/etc/feathertail/feathertail.toml` in place, keeps your comments, and can restart the service when it is done.
+
 ### Simple DHCP (without FeatherPanel)
 
 To use FeatherTail as a plain DHCP server, add one or more ranges. Any client that has no
