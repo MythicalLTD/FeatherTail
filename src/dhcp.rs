@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -12,7 +13,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
-use crate::config::DhcpConfig;
+use crate::config::{DhcpConfig, DhcpRange};
 use crate::dhcp_socket::{DhcpSocket, interface_name};
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -183,10 +184,91 @@ pub fn expand_ip_list(input: &str) -> Result<Vec<String>, DynError> {
     Ok(out)
 }
 
+/// Seconds an offered (not yet requested) dynamic IP stays reserved for the client.
+const DYNAMIC_OFFER_HOLD_SECS: i64 = 60;
+
+/// A validated `[[dhcp.ranges]]` entry.
+#[derive(Debug, Clone)]
+struct DynamicRange {
+    interface: Option<String>,
+    start: u32,
+    end: u32,
+    gateway: Ipv4Addr,
+    cidr: u8,
+    dns_servers: Vec<String>,
+    server_ip: Ipv4Addr,
+    lease_time_secs: u64,
+}
+
+impl DynamicRange {
+    fn from_config(raw: &DhcpRange, default_lease_secs: u64) -> Result<Self, DynError> {
+        let interface = match raw.interface.trim() {
+            "" => None,
+            name => {
+                validate_bridge_name(name)?;
+                Some(name.to_owned())
+            }
+        };
+        let start = parse_ipv4(raw.start.trim())
+            .map_err(|_| format!("invalid range start '{}'", raw.start.trim()))?;
+        let end = parse_ipv4(raw.end.trim())
+            .map_err(|_| format!("invalid range end '{}'", raw.end.trim()))?;
+        let gateway = parse_ipv4(raw.gateway.trim())
+            .map_err(|_| format!("invalid range gateway '{}'", raw.gateway.trim()))?;
+        let mask = subnet_mask_u32(raw.cidr)?;
+        let (s, e) = (ipv4_to_u32(start), ipv4_to_u32(end));
+        if s > e {
+            return Err(format!("invalid range {start}-{end}: start is after end").into());
+        }
+        let net = ipv4_to_u32(gateway) & mask;
+        if s & mask != net || e & mask != net {
+            return Err(format!(
+                "invalid range {start}-{end}: not inside {gateway}/{}",
+                raw.cidr
+            )
+            .into());
+        }
+        let server_ip = match raw.server_ip.as_deref().map(str::trim) {
+            None | Some("") => gateway,
+            Some(v) => parse_ipv4(v).map_err(|_| format!("invalid range server_ip '{v}'"))?,
+        };
+        Ok(Self {
+            interface,
+            start: s,
+            end: e,
+            gateway,
+            cidr: raw.cidr,
+            dns_servers: normalize_dns_list(&raw.dns_servers)?,
+            server_ip,
+            lease_time_secs: raw.lease_time_secs.unwrap_or(default_lease_secs).max(60),
+        })
+    }
+
+    fn serves_interface(&self, ifname: Option<&str>) -> bool {
+        match (&self.interface, ifname) {
+            (None, _) | (_, None) => true,
+            (Some(want), Some(got)) => want == got,
+        }
+    }
+
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        (self.start..=self.end).contains(&ipv4_to_u32(ip))
+    }
+
+    /// Network, broadcast, gateway and server addresses are never handed out.
+    fn assignable(&self, ip: Ipv4Addr) -> bool {
+        let host_bits = !subnet_mask_u32(self.cidr).unwrap_or(u32::MAX);
+        let u = ipv4_to_u32(ip);
+        let net_or_bcast = self.cidr < 31 && (u & host_bits == 0 || u & host_bits == host_bits);
+        self.contains(ip) && !net_or_bcast && ip != self.gateway && ip != self.server_ip
+    }
+}
+
 #[derive(Clone)]
 pub struct DhcpService {
     config: DhcpConfig,
     pool: SqlitePool,
+    ranges: Vec<DynamicRange>,
 }
 
 struct ParsedDhcpRequest {
@@ -218,7 +300,24 @@ impl DhcpService {
             .connect_with(opts)
             .await?;
 
-        let service = Self { config, pool };
+        let mut ranges = Vec::new();
+        for raw in &config.ranges {
+            match DynamicRange::from_config(raw, config.lease_time_secs) {
+                Ok(range) => {
+                    info!(
+                        interface = ?range.interface,
+                        start = %Ipv4Addr::from(range.start),
+                        end = %Ipv4Addr::from(range.end),
+                        gateway = %range.gateway,
+                        "dhcp dynamic range loaded"
+                    );
+                    ranges.push(range);
+                }
+                Err(err) => warn!(error = %err, "ignoring invalid [[dhcp.ranges]] entry"),
+            }
+        }
+
+        let service = Self { config, pool, ranges };
         service.ensure_schema().await?;
 
         info!(
@@ -531,6 +630,130 @@ impl DhcpService {
         Ok(result.rows_affected() > 0)
     }
 
+    // ---- Simple dynamic DHCP ([[dhcp.ranges]]) ------------------------------------------
+
+    fn range_for(&self, ip: Ipv4Addr, ifname: Option<&str>) -> Option<&DynamicRange> {
+        self.ranges
+            .iter()
+            .find(|r| r.serves_interface(ifname) && r.contains(ip))
+    }
+
+    /// IPs that must not be handed to `mac`: static leases, live leases of other clients,
+    /// and everything the admin put in the IP pool.
+    async fn taken_ips(&self, mac: &str) -> Result<HashSet<Ipv4Addr>, DynError> {
+        let rows = sqlx::query(
+            "SELECT ip FROM dhcp_leases WHERE mac != ? AND (static_flag = 1 OR (state = 'active' AND lease_end > ?)) \
+             UNION SELECT ip FROM dhcp_pool",
+        )
+        .bind(mac)
+        .bind(now_unix())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("ip").ok())
+            .filter_map(|ip| ip.parse().ok())
+            .collect())
+    }
+
+    /// Picks (or keeps) a dynamic IP for a client without a static lease and stores it.
+    /// `ack` = the client sent REQUEST, so the lease gets its full time; an OFFER only
+    /// holds the IP for a short while. Returns the lease and its full lease time.
+    async fn allocate_dynamic(
+        &self,
+        mac: &str,
+        ifname: Option<&str>,
+        existing: Option<&DhcpLease>,
+        requested: Option<Ipv4Addr>,
+        ack: bool,
+    ) -> Result<Option<(DhcpLease, u64)>, DynError> {
+        if self.ranges.is_empty() {
+            return Ok(None);
+        }
+        let taken = self.taken_ips(mac).await?;
+        let usable = |ip: Ipv4Addr| -> Option<&DynamicRange> {
+            self.range_for(ip, ifname)
+                .filter(|r| r.assignable(ip) && !taken.contains(&ip))
+        };
+
+        // Prefer the client's previous IP, then the one it asks for, then the first free one.
+        let previous = existing.and_then(|l| l.ip.parse::<Ipv4Addr>().ok());
+        let mut chosen = previous
+            .and_then(|ip| usable(ip).map(|r| (ip, r)))
+            .or_else(|| requested.and_then(|ip| usable(ip).map(|r| (ip, r))));
+        if chosen.is_none() {
+            chosen = self
+                .ranges
+                .iter()
+                .filter(|r| r.serves_interface(ifname))
+                .find_map(|r| {
+                    (r.start..=r.end)
+                        .map(Ipv4Addr::from)
+                        .find(|ip| r.assignable(*ip) && !taken.contains(ip))
+                        .map(|ip| (ip, r))
+                });
+        }
+        let Some((ip, range)) = chosen else {
+            warn!(mac, iface = ?ifname, "dhcp dynamic ranges: no free ip for client");
+            return Ok(None);
+        };
+
+        let ip_s = ip.to_string();
+        let same_ip = existing.filter(|l| l.ip == ip_s && l.state == "active");
+        let now = now_unix();
+        let lease_end = if ack {
+            now + i64::try_from(range.lease_time_secs).unwrap_or(86_400)
+        } else {
+            same_ip
+                .map(|l| l.lease_end)
+                .unwrap_or(0)
+                .max(now + DYNAMIC_OFFER_HOLD_SECS)
+        };
+        let lease_start = if ack { now } else { same_ip.map(|l| l.lease_start).unwrap_or(now) };
+        let hostname = existing.and_then(|l| l.hostname.clone());
+
+        sqlx::query(
+            "INSERT INTO dhcp_leases (mac, ip, hostname, vmid, node, gateway, cidr, dns_servers, lease_start, lease_end, state, static_flag, updated_at) \
+             VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, 'active', 0, ?) \
+             ON CONFLICT(mac) DO UPDATE SET \
+                 ip = excluded.ip, gateway = excluded.gateway, cidr = excluded.cidr, \
+                 dns_servers = excluded.dns_servers, lease_start = excluded.lease_start, \
+                 lease_end = excluded.lease_end, state = 'active', updated_at = excluded.updated_at \
+             WHERE dhcp_leases.static_flag = 0",
+        )
+        .bind(mac)
+        .bind(&ip_s)
+        .bind(hostname.clone())
+        .bind(range.gateway.to_string())
+        .bind(i64::from(range.cidr))
+        .bind(serde_json::to_string(&range.dns_servers)?)
+        .bind(lease_start)
+        .bind(lease_end)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        if previous != Some(ip) {
+            info!(mac, ip = %ip, iface = ?ifname, "dhcp dynamic ip allocated");
+        }
+
+        let lease = DhcpLease {
+            mac: mac.to_owned(),
+            ip: ip_s,
+            hostname,
+            vmid: None,
+            node: None,
+            gateway: range.gateway.to_string(),
+            cidr: range.cidr,
+            dns_servers: range.dns_servers.clone(),
+            lease_start,
+            lease_end,
+            state: "active".to_owned(),
+            static_lease: false,
+        };
+        Ok(Some((lease, range.lease_time_secs)))
+    }
+
     pub async fn run_listener(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), DynError> {
         if !self.config.enabled {
             info!("dhcp listener disabled by config");
@@ -590,7 +813,46 @@ impl DhcpService {
             return Ok(());
         }
 
-        let lease = self.find_lease_by_mac(&request.mac).await?;
+        let mut lease = self.find_lease_by_mac(&request.mac).await?;
+
+        // Simple DHCP: clients without a static lease get an IP from [[dhcp.ranges]].
+        // `dynamic` = (full lease time to advertise, server identifier of the range).
+        let mut dynamic: Option<(u64, Ipv4Addr)> = None;
+        let wants_dynamic = !self.ranges.is_empty()
+            && matches!(request.msg_type, DHCP_DISCOVER | DHCP_REQUEST)
+            && lease.as_ref().is_none_or(|l| !l.static_lease)
+            && self.host_allowed(&request.mac, None);
+        if wants_dynamic {
+            let requested = request
+                .requested_ip
+                .or_else(|| (request.ciaddr != Ipv4Addr::UNSPECIFIED).then_some(request.ciaddr));
+            let allocated = self
+                .allocate_dynamic(
+                    &request.mac,
+                    ifname,
+                    lease.as_ref(),
+                    requested,
+                    request.msg_type == DHCP_REQUEST,
+                )
+                .await?;
+            match allocated {
+                Some((new_lease, secs)) => {
+                    let server = new_lease
+                        .ip
+                        .parse()
+                        .ok()
+                        .and_then(|ip| self.range_for(ip, ifname))
+                        .map(|r| r.server_ip);
+                    if let Some(server) = server {
+                        dynamic = Some((secs, server));
+                    }
+                    lease = Some(new_lease);
+                }
+                // No free IP here: forget the stale dynamic lease so a REQUEST gets a NAK.
+                None => lease = None,
+            }
+        }
+
         let lease_vmid = lease.as_ref().and_then(|l| l.vmid);
         let pool_entry = match lease.as_ref() {
             Some(l) => self.find_pool_ip(&l.ip).await?,
@@ -611,7 +873,10 @@ impl DhcpService {
             }
         }
 
-        let server_ip = match pool_entry.as_ref().and_then(PoolIp::server_identifier) {
+        let server_ip = match dynamic
+            .map(|(_, server)| server)
+            .or_else(|| pool_entry.as_ref().and_then(PoolIp::server_identifier))
+        {
             Some(ip) => ip,
             None => parse_ipv4(&self.config.server_ip)?,
         };
@@ -688,7 +953,12 @@ impl DhcpService {
             return Ok(());
         }
 
-        let lease = if response_type == DHCP_ACK {
+        let lease = if let Some((secs, _)) = dynamic {
+            // Already stored by allocate_dynamic; the OFFER advertises the full lease time.
+            let mut shown = lease;
+            shown.lease_end = now_unix() + i64::try_from(secs).unwrap_or(86_400);
+            shown
+        } else if response_type == DHCP_ACK {
             match self.renew_lease_by_mac(&lease.mac).await? {
                 Some(refreshed) => refreshed,
                 other => other.unwrap_or(lease),
@@ -702,7 +972,7 @@ impl DhcpService {
             &lease,
             response_type,
             server_ip,
-            self.config.lease_time_secs,
+            dynamic.map_or(self.config.lease_time_secs, |(secs, _)| secs),
         )?;
         let target = resolve_dhcp_target(&request, src);
         socket.send(&response, target, ifindex).await?;
@@ -1228,6 +1498,77 @@ mod tests {
 
         assert!(svc.remove_lease_by_mac("AA-AA-AA-AA-AA-03").await.unwrap());
         assert!(svc.delete_pool_ip("10.0.0.41").await.unwrap());
+        svc.pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn dynamic_ranges_hand_out_free_ips() {
+        let path = std::env::temp_dir().join(format!(
+            "ft-dhcp-dyn-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let cfg = DhcpConfig {
+            database_path: path.to_string_lossy().to_string(),
+            ranges: vec![
+                DhcpRange {
+                    interface: "vmbr1".into(),
+                    start: "10.0.0.1".into(),
+                    end: "10.0.0.4".into(),
+                    gateway: "10.0.0.1".into(),
+                    cidr: 24,
+                    dns_servers: vec!["1.1.1.1".into()],
+                    server_ip: None,
+                    lease_time_secs: Some(600),
+                },
+                // Invalid (outside the gateway's subnet): skipped at startup.
+                DhcpRange {
+                    interface: String::new(),
+                    start: "192.168.5.10".into(),
+                    end: "192.168.5.20".into(),
+                    gateway: "10.0.0.1".into(),
+                    cidr: 24,
+                    dns_servers: vec![],
+                    server_ip: None,
+                    lease_time_secs: None,
+                },
+            ],
+            ..DhcpConfig::default()
+        };
+        let svc = DhcpService::new(cfg).await.unwrap();
+        assert_eq!(svc.ranges.len(), 1);
+        let a = "aa:00:00:00:00:01";
+        let b = "aa:00:00:00:00:02";
+
+        // .1 is the gateway; the admin pool reserves .2 -> first client gets .3.
+        svc.upsert_pool(vec![pool_ip("10.0.0.2", "vmbr1")]).await.unwrap();
+        let (offer, secs) = svc.allocate_dynamic(a, Some("vmbr1"), None, None, false).await.unwrap().unwrap();
+        assert_eq!((offer.ip.as_str(), secs), ("10.0.0.3", 600));
+        assert!(!offer.static_lease);
+
+        // Wrong interface: nothing served.
+        assert!(svc.allocate_dynamic(b, Some("vmbr0"), None, None, false).await.unwrap().is_none());
+
+        // Second client cannot take .3 even if it asks for it.
+        let req = Some(Ipv4Addr::new(10, 0, 0, 3));
+        let (other, _) = svc.allocate_dynamic(b, Some("vmbr1"), None, req, true).await.unwrap().unwrap();
+        assert_eq!(other.ip, "10.0.0.4");
+
+        // First client's REQUEST keeps its IP and gets the full lease.
+        let existing = svc.find_lease_by_mac(a).await.unwrap();
+        let (acked, _) = svc.allocate_dynamic(a, Some("vmbr1"), existing.as_ref(), req, true).await.unwrap().unwrap();
+        assert_eq!(acked.ip, "10.0.0.3");
+        assert!(acked.lease_end >= now_unix() + 590);
+
+        // Range full.
+        assert!(svc.allocate_dynamic("aa:00:00:00:00:03", Some("vmbr1"), None, None, false).await.unwrap().is_none());
+
+        // A released lease frees its IP for someone else.
+        svc.release_lease_by_mac(b).await.unwrap();
+        let (c, _) = svc.allocate_dynamic("aa:00:00:00:00:03", Some("vmbr1"), None, None, false).await.unwrap().unwrap();
+        assert_eq!(c.ip, "10.0.0.4");
+
         svc.pool.close().await;
         let _ = std::fs::remove_file(path);
     }

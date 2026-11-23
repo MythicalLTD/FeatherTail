@@ -85,6 +85,38 @@ firewall_allow_vmids = []
 firewall_deny_vmids = []
 ```
 
+### Simple DHCP (without FeatherPanel)
+
+To use FeatherTail as a plain DHCP server, add one or more ranges. Any client that has no
+lease then gets a free IP from the range automatically. You don't need FeatherPanel, the
+admin UI or the API.
+
+```toml
+[dhcp]
+enabled = true
+lease_time_secs = 86400
+
+[[dhcp.ranges]]
+interface = "vmbr1"              # answer only on this bridge ("" = any interface)
+start = "10.0.0.100"
+end = "10.0.0.200"
+gateway = "10.0.0.1"
+cidr = 24
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+# server_ip = "10.0.0.1"         # optional, defaults to gateway
+# lease_time_secs = 3600         # optional, defaults to dhcp.lease_time_secs
+```
+
+Then run `sudo systemctl restart feathertail`.
+
+- A client keeps the same IP across renewals and restarts while its old IP is still free.
+- Static leases (from FeatherPanel, the API or the UI) always win. IPs held by static leases or listed in the UI **IP Pool** are never handed out dynamically.
+- The gateway, the server IP and the network/broadcast addresses are skipped.
+- An offered IP is held for 60 s. After the client's REQUEST, the lease runs for the full lease time. When a lease expires or the client releases it, the IP is free again.
+- Dynamic leases appear in the UI and in `GET /dhcp/leases` with `static_lease: false`.
+- Invalid ranges (for example, a range outside the gateway's subnet) are logged and skipped at startup.
+- The `firewall_*` settings also apply to dynamic clients. With `allowlist`, only the listed MACs get an IP.
+
 ## API
 
 Base path: `/api/v1` — docs at `/docs`, OpenAPI at `/openapi.json`.

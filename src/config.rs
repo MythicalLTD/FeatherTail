@@ -143,6 +143,34 @@ pub struct DhcpConfig {
     pub firewall_allow_vmids: Vec<u32>,
     #[serde(default)]
     pub firewall_deny_vmids: Vec<u32>,
+    /// Simple DHCP (no FeatherPanel needed): any client without a lease gets a free IP
+    /// from one of these ranges. Leave empty to only answer MACs that already have a lease.
+    #[serde(default)]
+    pub ranges: Vec<DhcpRange>,
+}
+
+/// A dynamic address range, configured in `feathertail.toml` as `[[dhcp.ranges]]`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DhcpRange {
+    /// Only answer on this interface/bridge (e.g. `vmbr1`). Empty = any interface.
+    #[serde(default)]
+    pub interface: String,
+    /// First IP handed out (inclusive).
+    pub start: String,
+    /// Last IP handed out (inclusive).
+    pub end: String,
+    /// Router option sent to clients.
+    pub gateway: String,
+    #[serde(default = "default_range_cidr")]
+    pub cidr: u8,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    /// DHCP server identifier. Defaults to the gateway when empty.
+    #[serde(default)]
+    pub server_ip: Option<String>,
+    /// Lease time for this range. Defaults to `dhcp.lease_time_secs`.
+    #[serde(default)]
+    pub lease_time_secs: Option<u64>,
 }
 
 impl Default for DhcpConfig {
@@ -158,6 +186,7 @@ impl Default for DhcpConfig {
             firewall_deny_macs: Vec::new(),
             firewall_allow_vmids: Vec::new(),
             firewall_deny_vmids: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 }
@@ -208,6 +237,10 @@ fn default_dhcp_lease_time_secs() -> u64 {
 
 fn default_dhcp_database_path() -> String {
     "/var/lib/feathertail/dhcp.sqlite3".to_owned()
+}
+
+fn default_range_cidr() -> u8 {
+    24
 }
 
 fn default_dhcp_firewall_mode() -> String {
@@ -282,6 +315,13 @@ database_path = "/tmp/test.sqlite"
 firewall_mode = "allowlist"
 firewall_allow_macs = ["aa:bb:cc:dd:ee:ff"]
 firewall_allow_vmids = [100]
+
+[[dhcp.ranges]]
+interface = "vmbr1"
+start = "10.0.0.100"
+end = "10.0.0.200"
+gateway = "10.0.0.1"
+dns_servers = ["1.1.1.1"]
 "#;
 
         fs::write(&path, contents).expect("fixture write should succeed");
@@ -291,6 +331,9 @@ firewall_allow_vmids = [100]
         assert_eq!(loaded.proxmox.pct_bin, "/usr/sbin/pct");
         assert_eq!(loaded.dhcp.firewall_mode, "allowlist");
         assert_eq!(loaded.dhcp.firewall_allow_vmids, vec![100]);
+        assert_eq!(loaded.dhcp.ranges.len(), 1);
+        assert_eq!(loaded.dhcp.ranges[0].cidr, 24);
+        assert_eq!(loaded.dhcp.ranges[0].interface, "vmbr1");
 
         let _ = fs::remove_file(&path);
     }

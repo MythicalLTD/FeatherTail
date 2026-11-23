@@ -30,3 +30,18 @@ firewall_allow_macs = []
 firewall_deny_macs = []
 firewall_allow_vmids = []
 firewall_deny_vmids = []
+
+# Simple DHCP without FeatherPanel: uncomment a range and set enabled = true above.
+# Any client without a lease gets a free IP from the range (on that interface only).
+# IPs used by static leases or the admin UI IP pool are skipped automatically.
+# Repeat the [[dhcp.ranges]] block for more bridges/subnets.
+#
+# [[dhcp.ranges]]
+# interface = "vmbr1"          # bridge to answer on; "" = any interface
+# start = "10.0.0.100"
+# end = "10.0.0.200"
+# gateway = "10.0.0.1"
+# cidr = 24
+# dns_servers = ["1.1.1.1", "8.8.8.8"]
+# server_ip = ""               # optional, defaults to the gateway
+# lease_time_secs = 86400      # optional, defaults to dhcp.lease_time_secs
