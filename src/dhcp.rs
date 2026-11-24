@@ -282,6 +282,8 @@ pub struct DhcpService {
     config: DhcpConfig,
     pool: SqlitePool,
     ranges: Vec<DynamicRange>,
+    /// Woken whenever a lease is handed out or changed, so Proxmox IP tags update right away.
+    lease_changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 struct ParsedDhcpRequest {
@@ -330,7 +332,12 @@ impl DhcpService {
             }
         }
 
-        let service = Self { config, pool, ranges };
+        let service = Self {
+            config,
+            pool,
+            ranges,
+            lease_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
         service.ensure_schema().await?;
 
         info!(
@@ -340,6 +347,11 @@ impl DhcpService {
             "dhcp service initialized"
         );
         Ok(service)
+    }
+
+    /// Resolves once a lease was handed out or changed since the last call.
+    pub fn lease_changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.lease_changed)
     }
 
     pub fn enabled(&self) -> bool {
@@ -460,6 +472,8 @@ impl DhcpService {
             state: "active".to_owned(),
             static_lease: true,
         };
+
+        self.lease_changed.notify_one();
 
         info!(
             mac = %lease.mac,
@@ -1063,6 +1077,11 @@ impl DhcpService {
             target = %target,
             "dhcp response sent"
         );
+
+        if response_type == DHCP_ACK {
+            // The guest is up and took its address: tag it in Proxmox now.
+            self.lease_changed.notify_one();
+        }
 
         if let Err(e) = self.record_response(&lease.mac, &lease.ip, response_type).await {
             warn!(mac = %lease.mac, error = %e, "failed to record dhcp activity");

@@ -141,11 +141,7 @@ impl Daemon {
             }
         }
 
-        if self.config.proxmox.sync_ip_tags {
-            if let Err(err) = self.sync_ip_tags().await {
-                warn!(error = %err, "proxmox ip tag sync failed");
-            }
-        }
+        self.sync_ip_tags_logged().await;
 
         if self.info_yapless {
             debug!("daemon poll cycle completed");
@@ -154,6 +150,15 @@ impl Daemon {
         }
 
         Ok(())
+    }
+
+    async fn sync_ip_tags_logged(&self) {
+        if !self.config.proxmox.sync_ip_tags {
+            return;
+        }
+        if let Err(err) = self.sync_ip_tags().await {
+            warn!(error = %err, "proxmox ip tag sync failed");
+        }
     }
 
     /// Puts every guest's DHCP lease IPs on it as Proxmox tags and removes the ones
@@ -256,6 +261,13 @@ impl Daemon {
         let dhcp = Arc::clone(&self.dhcp);
         let dhcp_task = tokio::spawn(async move { dhcp.run_listener(dhcp_shutdown_rx).await });
 
+        // Full scan right at startup: every guest that already has a lease gets its IP tags.
+        if self.config.proxmox.sync_ip_tags {
+            info!("initial proxmox ip tag scan");
+            self.sync_ip_tags_logged().await;
+        }
+        let lease_changed = self.dhcp.lease_changed();
+
         let mut ticker = tokio::time::interval(Duration::from_secs(self.config.daemon.poll_interval_secs));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -268,6 +280,15 @@ impl Daemon {
                                 error!(error = %err, "daemon tick failed");
                             }
                         }
+                        _ = shutdown_signal() => {
+                            info!("shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+                _ = lease_changed.notified() => {
+                    select! {
+                        _ = self.sync_ip_tags_logged() => {}
                         _ = shutdown_signal() => {
                             info!("shutdown signal received");
                             break;
