@@ -163,6 +163,27 @@ impl ProxmoxClient {
         Ok(())
     }
 
+    /// Replaces the tag list of a qemu VM or lxc container (`kind` = "qemu" | "lxc").
+    pub async fn set_guest_tags(&self, node: &str, kind: &str, vmid: u32, tags: &[String]) -> Result<(), DynError> {
+        let path = format!("/nodes/{node}/{kind}/{vmid}/config");
+        let mut cmd = Command::new(&self.pvesh_bin);
+        cmd.arg("set").arg(&path);
+        if tags.is_empty() {
+            cmd.arg("--delete").arg("tags");
+        } else {
+            cmd.arg("--tags").arg(tags.join(";"));
+        }
+        let output = cmd.output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let err = io::Error::other(format!("pvesh set {path} --tags failed: {stderr}"));
+            return Err(Box::new(err));
+        }
+
+        Ok(())
+    }
+
     async fn get_json(&self, path: &str) -> Result<Value, DynError> {
         let output = Command::new(&self.pvesh_bin)
             .arg("get")

@@ -141,10 +141,74 @@ impl Daemon {
             }
         }
 
+        if self.config.proxmox.sync_ip_tags {
+            if let Err(err) = self.sync_ip_tags().await {
+                warn!(error = %err, "proxmox ip tag sync failed");
+            }
+        }
+
         if self.info_yapless {
             debug!("daemon poll cycle completed");
         } else {
             info!("daemon poll cycle completed");
+        }
+
+        Ok(())
+    }
+
+    /// Puts every guest's DHCP lease IPs on it as Proxmox tags and removes the ones
+    /// FeatherTail added earlier whose lease is gone. Hand-made tags are never touched.
+    async fn sync_ip_tags(&self) -> Result<(), DynError> {
+        let leases = self.dhcp.list_leases().await?;
+        let mut managed = self.dhcp.managed_ip_tags().await?;
+        let guests = crate::inventory::list_guests(&self.config.proxmox.pvesh_bin).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+
+        let live: Vec<_> = leases
+            .iter()
+            .filter(|l| l.static_lease || (l.state == "active" && l.lease_end > now))
+            .collect();
+
+        for guest in guests.iter().filter(|g| !g.template) {
+            let macs: HashSet<&str> = guest.nics.iter().map(|n| n.mac.as_str()).collect();
+            let desired: Vec<String> = {
+                let mut ips: Vec<String> = live
+                    .iter()
+                    .filter(|l| l.vmid == Some(guest.vmid) || macs.contains(l.mac.as_str()))
+                    .map(|l| l.ip.clone())
+                    .collect();
+                ips.sort();
+                ips.dedup();
+                ips
+            };
+            let previously = managed.remove(&guest.vmid).unwrap_or_default();
+            if desired.is_empty() && previously.is_empty() {
+                continue;
+            }
+
+            let (new_tags, new_managed) = plan_ip_tags(&guest.tags, &previously, &desired);
+            if new_tags != guest.tags {
+                if let Err(err) = self
+                    .proxmox
+                    .set_guest_tags(&guest.node, &guest.kind, guest.vmid, &new_tags)
+                    .await
+                {
+                    warn!(vmid = guest.vmid, error = %err, "failed to update proxmox ip tags");
+                    continue;
+                }
+                info!(vmid = guest.vmid, tags = %new_tags.join(";"), "proxmox ip tags updated");
+            }
+            if new_managed != previously {
+                self.dhcp.set_managed_ip_tags(guest.vmid, &new_managed).await?;
+            }
+        }
+
+        // Guests that no longer exist: forget their tags.
+        for vmid in managed.into_keys() {
+            self.dhcp.set_managed_ip_tags(vmid, &HashSet::new()).await?;
         }
 
         Ok(())
@@ -235,6 +299,33 @@ impl Daemon {
     }
 }
 
+/// Returns the guest's new tag list and the set of tags FeatherTail now owns on it.
+/// Tags the user added by hand stay, even when they look like an IP.
+fn plan_ip_tags(
+    current: &[String],
+    managed: &HashSet<String>,
+    desired: &[String],
+) -> (Vec<String>, HashSet<String>) {
+    let desired_set: HashSet<&str> = desired.iter().map(String::as_str).collect();
+    let mut tags: Vec<String> = current
+        .iter()
+        .filter(|t| !managed.contains(*t) || desired_set.contains(t.as_str()))
+        .cloned()
+        .collect();
+
+    let mut owned = HashSet::new();
+    for ip in desired {
+        let present = tags.iter().any(|t| t.eq_ignore_ascii_case(ip));
+        if !present {
+            tags.push(ip.clone());
+            owned.insert(ip.clone());
+        } else if managed.contains(ip) {
+            owned.insert(ip.clone());
+        }
+    }
+    (tags, owned)
+}
+
 async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
     loop {
         if *rx.borrow() {
@@ -262,4 +353,50 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn adds_missing_ips_and_keeps_user_tags() {
+        let (tags, owned) = plan_ip_tags(&v(&["prod"]), &set(&[]), &v(&["10.0.0.5"]));
+        assert_eq!(tags, v(&["prod", "10.0.0.5"]));
+        assert_eq!(owned, set(&["10.0.0.5"]));
+    }
+
+    #[test]
+    fn removes_only_stale_managed_ips() {
+        let (tags, owned) = plan_ip_tags(
+            &v(&["prod", "10.0.0.5", "192.168.1.9"]),
+            &set(&["10.0.0.5"]),
+            &v(&["10.0.0.6"]),
+        );
+        assert_eq!(tags, v(&["prod", "192.168.1.9", "10.0.0.6"]));
+        assert_eq!(owned, set(&["10.0.0.6"]));
+    }
+
+    #[test]
+    fn does_not_claim_hand_made_ip_tag() {
+        let (tags, owned) = plan_ip_tags(&v(&["10.0.0.5"]), &set(&[]), &v(&["10.0.0.5"]));
+        assert_eq!(tags, v(&["10.0.0.5"]));
+        assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn no_change_when_in_sync() {
+        let current = v(&["web", "10.0.0.5"]);
+        let (tags, owned) = plan_ip_tags(&current, &set(&["10.0.0.5"]), &v(&["10.0.0.5"]));
+        assert_eq!(tags, current);
+        assert_eq!(owned, set(&["10.0.0.5"]));
+    }
 }

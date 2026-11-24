@@ -77,6 +77,10 @@ pub struct ProxmoxConfig {
     pub pvesh_bin: String,
     #[serde(default = "default_pct_bin")]
     pub pct_bin: String,
+    /// Add each guest's DHCP lease IPs as Proxmox tags (and drop them when the lease goes away).
+    /// Tags added by hand are never removed.
+    #[serde(default = "default_sync_ip_tags")]
+    pub sync_ip_tags: bool,
 }
 
 impl Default for ProxmoxConfig {
@@ -84,6 +88,7 @@ impl Default for ProxmoxConfig {
         Self {
             pvesh_bin: default_pvesh_bin(),
             pct_bin: default_pct_bin(),
+            sync_ip_tags: default_sync_ip_tags(),
         }
     }
 }
@@ -209,6 +214,10 @@ fn default_pvesh_bin() -> String {
 
 fn default_pct_bin() -> String {
     "pct".to_owned()
+}
+
+fn default_sync_ip_tags() -> bool {
+    true
 }
 
 fn default_api_bind() -> String {

@@ -593,6 +593,41 @@ impl DhcpService {
         row.map(|r| decode_lease_row(&r)).transpose()
     }
 
+    // ---- Proxmox IP tags --------------------------------------------------------------
+
+    /// Tags FeatherTail itself put on each guest, so it only ever removes its own.
+    pub async fn managed_ip_tags(&self) -> Result<std::collections::HashMap<u32, HashSet<String>>, DynError> {
+        let rows = sqlx::query("SELECT vmid, tag FROM proxmox_ip_tags")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut map: std::collections::HashMap<u32, HashSet<String>> = std::collections::HashMap::new();
+        for row in rows {
+            let vmid: i64 = row.try_get("vmid")?;
+            let tag: String = row.try_get("tag")?;
+            if let Ok(vmid) = u32::try_from(vmid) {
+                map.entry(vmid).or_default().insert(tag);
+            }
+        }
+        Ok(map)
+    }
+
+    pub async fn set_managed_ip_tags(&self, vmid: u32, tags: &HashSet<String>) -> Result<(), DynError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM proxmox_ip_tags WHERE vmid = ?")
+            .bind(i64::from(vmid))
+            .execute(&mut *tx)
+            .await?;
+        for tag in tags {
+            sqlx::query("INSERT INTO proxmox_ip_tags (vmid, tag) VALUES (?, ?)")
+                .bind(i64::from(vmid))
+                .bind(tag)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ---- IP pool (admin UI) -------------------------------------------------------------
 
     pub async fn list_pool(&self) -> Result<Vec<PoolIp>, DynError> {
@@ -1144,6 +1179,11 @@ impl DhcpService {
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dhcp_pool (                ip TEXT PRIMARY KEY,                bridge TEXT NOT NULL,                gateway TEXT NOT NULL,                cidr INTEGER NOT NULL,                dns_servers TEXT NOT NULL DEFAULT '[]',                server_ip TEXT,                notes TEXT,                updated_at INTEGER NOT NULL            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS proxmox_ip_tags (vmid INTEGER NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (vmid, tag))",
         )
         .execute(&self.pool)
         .await?;

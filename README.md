@@ -65,6 +65,8 @@ log_level = "info-yapless"
 [proxmox]
 pvesh_bin = "pvesh"
 pct_bin = "pct"
+# Show DHCP lease IPs as tags on the VM/CT in Proxmox (hand-made tags are left alone).
+sync_ip_tags = true
 
 [api]
 bind = "0.0.0.0:8686"

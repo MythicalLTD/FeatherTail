@@ -71,6 +71,7 @@ export interface GuestView {
   status: string | null
   template: boolean
   nics: NicView[]
+  tags: string[]
 }
 
 export interface PoolHolder {

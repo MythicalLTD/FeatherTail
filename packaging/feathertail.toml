@@ -6,6 +6,8 @@ log_level = "info"
 [proxmox]
 pvesh_bin = "pvesh"
 pct_bin = "pct"
+# Show DHCP lease IPs as tags on the VM/CT in Proxmox (hand-made tags are left alone).
+sync_ip_tags = true
 
 [api]
 # Reachable from FeatherPanel by default. Firewall-restrict to the panel IP.

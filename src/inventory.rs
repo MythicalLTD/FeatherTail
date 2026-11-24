@@ -34,6 +34,8 @@ pub struct Guest {
     pub status: Option<String>,
     pub template: bool,
     pub nics: Vec<GuestNic>,
+    /// Proxmox tags, in config order.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -126,6 +128,7 @@ pub fn parse_guest_config(vmid: u32, kind: &str, node: &str, contents: &str) -> 
     let mut name = None;
     let mut template = false;
     let mut nics = Vec::new();
+    let mut tags = Vec::new();
 
     for line in contents.lines() {
         let line = line.trim();
@@ -141,6 +144,7 @@ pub fn parse_guest_config(vmid: u32, kind: &str, node: &str, contents: &str) -> 
         match key {
             "name" | "hostname" => name = Some(value.to_owned()),
             "template" => template = value == "1",
+            "tags" => tags = parse_tags(value),
             k if k.starts_with("net") && k[3..].chars().all(|c| c.is_ascii_digit()) && k.len() > 3 => {
                 if let Some(nic) = parse_nic(k, kind, value) {
                     nics.push(nic);
@@ -160,7 +164,18 @@ pub fn parse_guest_config(vmid: u32, kind: &str, node: &str, contents: &str) -> 
         status: None,
         template,
         nics,
+        tags,
     }
+}
+
+/// Proxmox accepts `;`, `,` and spaces as tag separators.
+pub fn parse_tags(value: &str) -> Vec<String> {
+    value
+        .split([';', ',', ' '])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_nic(key: &str, kind: &str, value: &str) -> Option<GuestNic> {
@@ -261,6 +276,14 @@ mod tests {
         assert_eq!(g.nics[0].bridge.as_deref(), Some("vmbr0"));
         assert_eq!(g.nics[1].vlan.as_deref(), Some("20"));
         assert_eq!(g.nics[1].model.as_deref(), Some("e1000"));
+    }
+
+    #[test]
+    fn parses_tags_with_any_separator() {
+        let guest = parse_guest_config(100, "qemu", "pve1", "name: a
+tags: prod;10.0.0.5, web x
+");
+        assert_eq!(guest.tags, vec!["prod", "10.0.0.5", "web", "x"]);
     }
 
     #[test]
