@@ -89,6 +89,7 @@ impl PoolIp {
             .filter(|v| !v.is_empty())
             .and_then(|v| v.parse().ok())
             .or_else(|| self.gateway.parse().ok())
+            .filter(|ip: &Ipv4Addr| !ip.is_unspecified())
     }
 
     /// Validates and normalizes user input.
@@ -97,7 +98,7 @@ impl PoolIp {
         validate_bridge_name(&self.bridge)?;
         let ip = parse_ipv4(self.ip.trim())
             .map_err(|_| format!("invalid ip '{}'", self.ip.trim()))?;
-        let gateway = parse_ipv4(self.gateway.trim())
+        let gateway = parse_gateway(self.gateway.trim())
             .map_err(|_| format!("invalid gateway '{}'", self.gateway.trim()))?;
         if ip == gateway {
             return Err(format!("invalid ip {ip}: it is the gateway itself").into());
@@ -220,7 +221,7 @@ impl DynamicRange {
             .map_err(|_| format!("invalid range start '{}'", raw.start.trim()))?;
         let end = parse_ipv4(raw.end.trim())
             .map_err(|_| format!("invalid range end '{}'", raw.end.trim()))?;
-        let gateway = parse_ipv4(raw.gateway.trim())
+        let gateway = parse_gateway(raw.gateway.trim())
             .map_err(|_| format!("invalid range gateway '{}'", raw.gateway.trim()))?;
         let mask = subnet_mask_u32(raw.cidr)?;
         let (s, e) = (ipv4_to_u32(start), ipv4_to_u32(end));
@@ -235,6 +236,9 @@ impl DynamicRange {
             .into());
         }
         let server_ip = match raw.server_ip.as_deref().map(str::trim) {
+            None | Some("") if gateway == Ipv4Addr::UNSPECIFIED => {
+                return Err("a range without a gateway needs server_ip".into());
+            }
             None | Some("") => gateway,
             Some(v) => parse_ipv4(v).map_err(|_| format!("invalid range server_ip '{v}'"))?,
         };
@@ -394,7 +398,7 @@ impl DhcpService {
     pub async fn assign_static_lease(&self, input: AssignLeaseInput) -> Result<DhcpLease, DynError> {
         let mac = normalize_mac(&input.mac)?;
         let ip_addr = parse_ipv4(&input.ip)?;
-        let gateway_addr = parse_ipv4(&input.gateway)?;
+        let gateway_addr = parse_gateway(input.gateway.trim())?;
         let effective_cidr =
             effective_cidr_for_gateway_and_ip(ip_addr, gateway_addr, input.cidr)?;
         if effective_cidr != input.cidr {
@@ -1238,6 +1242,9 @@ fn effective_cidr_for_gateway_and_ip(
     if requested_cidr == 0 {
         return Ok(0);
     }
+    if gateway == Ipv4Addr::UNSPECIFIED {
+        return Ok(requested_cidr);
+    }
     let ip_u = ipv4_to_u32(ip);
     let gw_u = ipv4_to_u32(gateway);
     let mask_r = subnet_mask_u32(requested_cidr)?;
@@ -1263,6 +1270,14 @@ fn effective_cidr_for_gateway_and_ip(
         "gateway outside the subnet: will be sent as an on-link route"
     );
     Ok(requested_cidr)
+}
+
+/// Like `parse_ipv4`, but "" means "no gateway" (0.0.0.0, no router option).
+fn parse_gateway(raw: &str) -> Result<Ipv4Addr, DynError> {
+    if raw.is_empty() {
+        return Ok(Ipv4Addr::UNSPECIFIED);
+    }
+    parse_ipv4(raw)
 }
 
 /// True when `gateway` is not inside `ip`/`cidr` and needs an explicit on-link route.
@@ -1372,7 +1387,7 @@ fn build_dhcp_response(
     configured_lease_secs: u64,
 ) -> Result<Vec<u8>, DynError> {
     let yiaddr = parse_ipv4(&lease.ip)?;
-    let gateway = parse_ipv4(&lease.gateway)?;
+    let gateway = parse_gateway(lease.gateway.trim())?;
     let subnet_mask = cidr_to_mask(lease.cidr);
 
     let now = now_unix();
@@ -1403,7 +1418,11 @@ fn build_dhcp_response(
     push_option(&mut out, 53, &[response_type]);
     push_option(&mut out, 54, &server_ip.octets());
     push_option(&mut out, 1, &subnet_mask.octets());
-    push_option(&mut out, 3, &gateway.octets());
+    // 0.0.0.0 = internal-only network (e.g. a private vmbr1 LAN): send no router
+    // option, so clients never get a default route over it.
+    if gateway != Ipv4Addr::UNSPECIFIED {
+        push_option(&mut out, 3, &gateway.octets());
+    }
     if gateway_needs_onlink_route(yiaddr, gateway, lease.cidr) {
         let routes = onlink_gateway_routes(gateway);
         push_option(&mut out, 121, &routes);
@@ -1935,4 +1954,76 @@ mod tests {
         // Mask stays /28.
         assert!(out.windows(6).any(|w| w == [1, 4, 255, 255, 255, 240]));
     }
+    /// Walks the options area and returns the codes present.
+    fn option_codes(resp: &[u8]) -> Vec<u8> {
+        let mut codes = Vec::new();
+        let mut i = 240;
+        while i < resp.len() {
+            let c = resp[i];
+            if c == 255 { break; }
+            if c == 0 { i += 1; continue; }
+            codes.push(c);
+            i += 2 + resp[i + 1] as usize;
+        }
+        codes
+    }
+
+    fn lan_lease(gateway: &str) -> DhcpLease {
+        DhcpLease {
+            mac: "bc:24:11:c4:eb:55".to_owned(),
+            ip: "10.0.0.100".to_owned(),
+            hostname: None,
+            vmid: Some(7000),
+            node: None,
+            gateway: gateway.to_owned(),
+            cidr: 24,
+            dns_servers: vec![],
+            lease_start: 0,
+            lease_end: i64::MAX,
+            state: "active".to_owned(),
+            static_lease: true,
+        }
+    }
+
+    #[test]
+    fn no_router_option_for_internal_lan() {
+        let packet = base_packet_with_options(&[53, 1, DHCP_DISCOVER, 255]);
+        let parsed = parse_dhcp_request(&packet).expect("packet should parse");
+        for gw in ["0.0.0.0", ""] {
+            let resp = build_dhcp_response(&parsed, &lan_lease(gw), DHCP_OFFER, Ipv4Addr::new(10, 0, 0, 1), 86_400)
+                .expect("response should build");
+            let codes = option_codes(&resp);
+            assert!(!codes.contains(&3), "gw={gw:?}: router option must be absent, got {codes:?}");
+            assert!(!codes.contains(&121), "gw={gw:?}: no classless routes");
+            assert!(codes.contains(&1) && codes.contains(&54) && codes.contains(&51));
+            assert_eq!(&resp[16..20], &[10, 0, 0, 100]);
+        }
+        // a normal gateway still gets option 3
+        let resp = build_dhcp_response(&parsed, &lan_lease("10.0.0.1"), DHCP_OFFER, Ipv4Addr::new(10, 0, 0, 1), 86_400).unwrap();
+        assert!(option_codes(&resp).contains(&3));
+    }
+
+    #[test]
+    fn pool_entry_without_gateway_validates() {
+        let mut e = PoolIp {
+            ip: "10.0.0.100".to_owned(),
+            bridge: "vmbr1".to_owned(),
+            gateway: "".to_owned(),
+            cidr: 24,
+            dns_servers: vec![],
+            server_ip: Some("10.0.0.1".to_owned()),
+            notes: None,
+        };
+        e.validate().expect("empty gateway must be accepted");
+        assert_eq!(e.gateway, "0.0.0.0");
+        assert_eq!(e.server_identifier(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        e.server_ip = None;
+        assert_eq!(e.server_identifier(), None, "never use 0.0.0.0 as server id");
+    }
+
+    #[test]
+    fn cidr_check_skipped_without_gateway() {
+        assert_eq!(effective_cidr_for_gateway_and_ip(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::UNSPECIFIED, 24).unwrap(), 24);
+    }
+
 }
